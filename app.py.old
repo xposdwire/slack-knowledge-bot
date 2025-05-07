@@ -1,0 +1,2143 @@
+﻿import os
+import time
+import re
+import io
+import base64
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import logging
+from pathlib import Path
+import pickle
+import random
+import tempfile
+import json
+
+# Third-party libraries
+import openai
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk.errors import SlackApiError
+from dotenv import load_dotenv
+
+# PDF and Image Processing
+import pytesseract
+import fitz  # PyMuPDF
+from PIL import Image
+import requests
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Try to import OpenCV (optional)
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# Set up enhanced logging
+def setup_enhanced_logging():
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Set up a rotating file handler
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        log_dir / "slack_bot.log",
+        maxBytes=10_000_000,  # 10MB
+        backupCount=5
+    )
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    
+    # Add file handler to logger
+    logger.addHandler(file_handler)
+    
+    # Log system information
+    import platform
+    import sys
+    logger.info(f"Starting bot on {platform.platform()}, Python {sys.version}")
+    
+    # Log environment information (excluding sensitive data)
+    env_vars = {}
+    for key in os.environ:
+        if key not in ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "OPENAI_API_KEY"]:
+            env_vars[key] = os.environ.get(key)
+    logger.info(f"Environment variables: {env_vars}")
+    
+    return logger
+
+# Load environment variables
+load_dotenv()
+
+# Initialize the Slack app
+app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
+
+# Initialize OpenAI client
+openai_api_key = os.environ.get("OPENAI_API_KEY")
+if openai_api_key:
+    openai.api_key = openai_api_key
+else:
+    logger.error("OpenAI API key not found in environment variables")
+
+# Configure Tesseract path if needed
+tesseract_path = os.environ.get("TESSERACT_PATH")
+if tesseract_path:
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+# Constants
+DATA_DIR = Path("channel_data")
+MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
+DOCUMENT_CACHE_DIR = DATA_DIR / "documents"
+MAX_TOKENS = 16000  # Adjust based on your OpenAI model's context window
+USE_CUSTOM_AI = os.environ.get("USE_CUSTOM_AI", "false").lower() == "true"
+CUSTOM_AI_ENDPOINT = os.environ.get("CUSTOM_AI_ENDPOINT", "https://bit.ly/bdigitalAI")
+
+# Auto-indexing and update settings
+AUTO_INDEX_ON_JOIN = True  # Whether to auto-index when joining channels
+AUTO_INDEX_DAYS = 30       # How many days to index when auto-indexing
+AUTO_UPDATE_INTERVAL = 15  # How often (in minutes) to check for new messages
+
+# Image and document settings
+ALLOWED_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
+ALLOWED_DOCUMENT_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt']
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_DOCUMENT_SIZE = 50 * 1024 * 1024  # 50MB
+
+def generate_search_message(query):
+    """Generate a varied and natural-sounding message when searching for information."""
+    # Detect question type
+    is_who_question = any(word in query.lower() for word in ["who", "person", "team", "responsible", "assigned"])
+    is_when_question = any(word in query.lower() for word in ["when", "date", "time", "schedule", "deadline"])
+    is_where_question = any(word in query.lower() for word in ["where", "location", "place", "room"])
+    is_how_question = any(word in query.lower() for word in ["how", "process", "method", "way", "procedure"])
+    is_what_question = any(word in query.lower() for word in ["what", "explain", "description", "details"])
+    is_why_question = any(word in query.lower() for word in ["why", "reason", "cause", "explain why"])
+    
+    # General responses
+    general_responses = [
+        "Let me check what I know about that...",
+        "I'll see what I can find...",
+        "Let me search through the messages...",
+        "Searching the channel history...",
+        "One moment while I look that up...",
+        "Let me dig through our conversations for that...",
+        "I'll check what's been discussed about this...",
+        "Hunting for relevant information...",
+        "Let me scan the channel for you...",
+    ]
+    
+    # Contextual responses based on question type
+    if is_who_question:
+        contextual = [
+            "Let me see who was mentioned in relation to this...",
+            "I'll find out who's involved with that...",
+            "Checking who's responsible for that...",
+            "Looking for the person connected to this...",
+        ]
+    elif is_when_question:
+        contextual = [
+            "Let me check the timeline on that...",
+            "I'll find when that was discussed...",
+            "Checking the dates mentioned...",
+            "Looking for timing information...",
+        ]
+    elif is_where_question:
+        contextual = [
+            "Let me find location details...",
+            "I'll see where that was mentioned...",
+            "Checking for place information...",
+        ]
+    elif is_how_question:
+        contextual = [
+            "Let me find out how that works...",
+            "I'll look for process details...",
+            "Checking for methods that were discussed...",
+            "Searching for instructions on that...",
+        ]
+    elif is_what_question:
+        contextual = [
+            "Let me get you details on that...",
+            "I'll find what's been said about this...",
+            "Checking what information we have...",
+            "Looking up the specifics...",
+        ]
+    elif is_why_question:
+        contextual = [
+            "Let me search for the reasoning behind that...",
+            "I'll look for explanations...",
+            "Checking why that decision was made...",
+            "Looking for the rationale...",
+        ]
+    else:
+        contextual = []
+    
+    # Combine and select
+    all_responses = general_responses + contextual
+    return random.choice(all_responses)
+
+
+class DocumentProcessor:
+    """Class for handling document and image processing."""
+    
+    @staticmethod
+    def process_image(image_data):
+        """Extract text from an image using OCR and analyze content using AI."""
+        try:
+            # Convert bytes to image
+            image = Image.open(io.BytesIO(image_data))
+            
+            # Try multiple OCR methods for better results
+            text = ""
+            
+            # 1. Basic Tesseract OCR
+            basic_text = pytesseract.image_to_string(image)
+            if basic_text and len(basic_text.strip()) > 0:
+                text += "OCR Text: " + basic_text.strip() + "\n\n"
+            
+            # 2. Try with different configurations for better results
+            custom_config = r'--oem 3 --psm 6'  # Assume a single uniform block of text
+            custom_text = pytesseract.image_to_string(image, config=custom_config)
+            if custom_text and len(custom_text.strip()) > 0 and custom_text.strip() != basic_text.strip():
+                text += "Additional OCR Text: " + custom_text.strip() + "\n\n"
+            
+            # 3. Try to detect if it's a drawing/diagram
+            # For diagrams, we can check if there are few text regions but many lines/shapes
+            
+            # Convert to grayscale and detect edges
+            gray = image.convert('L')
+            # Save to buffer to use with OpenCV
+            buffer = io.BytesIO()
+            gray.save(buffer, format="PNG")
+            buffer.seek(0)
+            
+            # Use OpenCV if available
+            if OPENCV_AVAILABLE:
+                try:
+                    # Convert PIL image to OpenCV format
+                    img_array = np.array(gray)
+                    
+                    # Use Canny edge detection to find edges
+                    edges = cv2.Canny(img_array, 50, 150)
+                    
+                    # Count the number of edge pixels
+                    edge_pixel_count = np.count_nonzero(edges)
+                    
+                    # Calculate the ratio of edge pixels to total pixels
+                    total_pixels = edges.shape[0] * edges.shape[1]
+                    edge_ratio = edge_pixel_count / total_pixels
+                    
+                    # If there are many edges but little text, it's likely a drawing
+                    if edge_ratio > 0.1 and len(basic_text.strip()) < 50:
+                        text += "Image Analysis: This appears to be a drawing or diagram with limited text content.\n\n"
+                        
+                        # Additional checks for specific types of diagrams
+                        # Count number of straight lines using HoughLinesP
+                        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
+                        
+                        if lines is not None and len(lines) > 10:
+                            text += "The image contains multiple straight lines, possibly a technical drawing, chart, or diagram.\n\n"
+                except Exception as cv_error:
+                    logger.error(f"Error during OpenCV image analysis: {cv_error}")
+            
+            # 4. Use OpenAI Vision API if available
+            try:
+                if hasattr(openai, "chat") and hasattr(openai.chat, "completions") and hasattr(openai.chat.completions, "create"):
+                    # Convert image to base64
+                    buffer = io.BytesIO()
+                    image.save(buffer, format="JPEG")
+                    buffer.seek(0)
+                    base64_image = base64.b64encode(buffer.read()).decode('utf-8')
+                    
+                    # Create API request
+                    vision_response = openai.chat.completions.create(
+                        model="gpt-4-vision-preview",  # Make sure this model exists and is accessible
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Describe what you see in this image. If it's a drawing, diagram, or chart, describe its content. If there's text visible, mention it."},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                                ]
+                            }
+                        ],
+                        max_tokens=300
+                    )
+                    
+                    # Add AI vision description to the text content
+                    if vision_response and vision_response.choices and len(vision_response.choices) > 0:
+                        ai_description = vision_response.choices[0].message.content
+                        text += "AI Vision Analysis: " + ai_description + "\n\n"
+            except Exception as ai_vision_error:
+                logger.error(f"Error during AI vision analysis: {ai_vision_error}")
+                # Continue without AI vision analysis
+            
+            # If we have no text content but tried all methods, indicate this might be an image without text
+            if not text:
+                text = "This appears to be an image without any extractable text content."
+            
+            return text
+        except Exception as e:
+            logger.error(f"Error processing image with OCR: {e}", exc_info=True)
+            return None
+    
+    @staticmethod
+    def process_pdf(pdf_data):
+        """Extract text from a PDF document."""
+        try:
+            # Use PyMuPDF to extract text
+            with fitz.open(stream=pdf_data, filetype="pdf") as doc:
+                text = ""
+                for page in doc:
+                    text += page.get_text()
+                
+                return text.strip()
+        except Exception as e:
+            logger.error(f"Error processing PDF: {e}")
+            return None
+    
+    @staticmethod
+    def generate_pdf(content, title="Generated Document"):
+        """Generate a PDF document with the provided content."""
+        try:
+            buffer = io.BytesIO()
+            
+            # Create a SimpleDocTemplate
+            doc = SimpleDocTemplate(
+                buffer, 
+                pagesize=letter,
+                rightMargin=72, 
+                leftMargin=72,
+                topMargin=72, 
+                bottomMargin=72
+            )
+            
+            styles = getSampleStyleSheet()
+            # Add a custom title style
+            styles.add(ParagraphStyle(
+                name='CustomTitle',
+                parent=styles['Title'],
+                fontSize=16,
+                spaceAfter=12
+            ))
+            
+            # Create document content
+            elements = []
+            
+            # Add title
+            elements.append(Paragraph(title, styles['CustomTitle']))
+            elements.append(Spacer(1, 12))
+            
+            # Add content paragraphs with better formatting
+            for paragraph in content.split('\n\n'):
+                if paragraph.strip():
+                    elements.append(Paragraph(paragraph, styles['Normal']))
+                    elements.append(Spacer(1, 6))
+            
+            # Build the document
+            try:
+                doc.build(elements)
+            except Exception as build_error:
+                logger.error(f"Error building PDF: {build_error}")
+                # Try a simpler approach if build fails
+                simple_buffer = io.BytesIO()
+                c = canvas.Canvas(simple_buffer, pagesize=letter)
+                
+                # Add title
+                c.setFont("Helvetica-Bold", 16)
+                c.drawString(72, 750, title)
+                
+                # Add content
+                c.setFont("Helvetica", 10)
+                y = 720
+                for line in content.split('\n'):
+                    if y < 72:  # New page if near bottom
+                        c.showPage()
+                        y = 750
+                    c.drawString(72, y, line[:80])  # Truncate long lines
+                    y -= 12
+                    
+                c.save()
+                simple_buffer.seek(0)
+                return simple_buffer.getvalue()
+            
+            # Get the PDF binary content
+            buffer.seek(0)
+            pdf_data = buffer.getvalue()
+            buffer.close()
+            
+            return pdf_data
+        except Exception as e:
+            logger.error(f"Error generating PDF: {e}", exc_info=True)
+            # Super simple fallback if everything else fails
+            try:
+                from reportlab.pdfgen import canvas
+                backup_buffer = io.BytesIO()
+                c = canvas.Canvas(backup_buffer)
+                c.setFont("Helvetica", 10)
+                c.drawString(100, 750, title)
+                y = 730
+                # Just add plain text, forget formatting
+                for line in content.split('\n')[:50]:  # Limit to prevent overflow
+                    c.drawString(100, y, line[:80])  # Limit line length
+                    y -= 12
+                    if y < 50:
+                        break
+                c.save()
+                backup_buffer.seek(0)
+                return backup_buffer.getvalue()
+            except Exception as final_e:
+                logger.error(f"Final PDF fallback failed: {final_e}")
+                return None
+    
+    @staticmethod
+    def generate_chart(data, title="Chart", chart_type="bar"):
+        """Generate a chart image based on the provided data."""
+        try:
+            plt.figure(figsize=(10, 6))
+            
+            if chart_type == "bar":
+                plt.bar(list(data.keys()), list(data.values()))
+            elif chart_type == "line":
+                plt.plot(list(data.keys()), list(data.values()))
+            elif chart_type == "pie":
+                plt.pie(list(data.values()), labels=list(data.keys()), autopct='%1.1f%%')
+            else:
+                # Default to bar chart
+                plt.bar(list(data.keys()), list(data.values()))
+            
+            plt.title(title)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            # Save to buffer
+            buffer = io.BytesIO()
+            plt.savefig(buffer, format='png')
+            buffer.seek(0)
+            
+            image_data = buffer.getvalue()
+            buffer.close()
+            plt.close()
+            
+            return image_data
+        except Exception as e:
+            logger.error(f"Error generating chart: {e}")
+            return None
+        
+class SlackKnowledgeBot:
+    def __init__(self):
+        """Initialize the bot with necessary data structures."""
+        self.channel_messages = {}  # Store messages by channel
+        self.user_info_cache = {}   # Cache user information
+        self.last_indexing = {}     # Track when channels were last indexed
+        self.last_query = {}        # Track last query per channel
+        self.last_context = {}      # Track last context per channel
+        self.document_cache = {}    # Cache for processed documents
+        
+        # Create data directories if they don't exist
+        DATA_DIR.mkdir(exist_ok=True)
+        DOCUMENT_CACHE_DIR.mkdir(exist_ok=True)
+        
+        # Load existing data if available
+        self._load_data()
+        
+        # Auto-save data periodically
+        self._setup_autosave()
+    
+    def _setup_autosave(self):
+        """Set up a timer to auto-save data and update channel information periodically."""
+        import threading
+        
+        def autosave():
+            self._save_data()
+            # Schedule the next autosave
+            threading.Timer(300, autosave).start()
+        
+        # Start the first timer for saving data
+        threading.Timer(300, autosave).start()
+        logger.info("Autosave timer initialized (every 5 minutes)")
+        
+        # Enhanced auto-reindex functionality
+        def auto_reindex():
+            logger.info("Starting auto-reindex cycle")
+            
+            # Keep track of how many messages we've indexed
+            total_new_messages = 0
+            channels_updated = 0
+            
+            for channel_id in self.channel_messages:
+                try:
+                    # Get the timestamp of the most recent message we have
+                    if not self.channel_messages[channel_id]:
+                        continue
+                        
+                    most_recent = max([msg["timestamp"] for msg in self.channel_messages[channel_id]])
+                    
+                    # Calculate how long ago that was
+                    time_since_last = datetime.now().timestamp() - most_recent
+                    hours_since_last = time_since_last / 3600
+                    
+                    # Only update if it's been more than 1 hour since the last message we have
+                    if hours_since_last > 1:
+                        logger.info(f"Auto-updating channel {channel_id}, fetching messages since last indexed")
+                        
+                        # Convert timestamp to datetime for logging
+                        last_msg_time = datetime.fromtimestamp(most_recent).strftime('%Y-%m-%d %H:%M:%S')
+                        logger.info(f"Most recent indexed message is from {last_msg_time}")
+                        
+                        # Instead of resetting all messages, we'll append new ones
+                        result_response = app.client.conversations_history(
+                            channel=channel_id,
+                            oldest=str(most_recent + 1),  # +1 second to avoid duplicate
+                            limit=100
+                        )
+                        result = result_response.data
+                        
+                        if not result["messages"]:
+                            logger.info(f"No new messages in channel {channel_id} since last update")
+                            continue
+                            
+                        # Process the new messages
+                        new_messages = []
+                        channel_info_response = app.client.conversations_info(channel=channel_id)
+                        channel_name = channel_info_response.data["channel"]["name"]
+                        
+                        for msg in result["messages"]:
+                            # Skip bot messages and non-text messages
+                            if msg.get("subtype") == "bot_message" or "text" not in msg:
+                                continue
+                                
+                            # Process user info and create message record
+                            user_id = msg.get("user")
+                            user_name = "Unknown User"
+                            
+                            if user_id:
+                                if user_id not in self.user_info_cache:
+                                    try:
+                                        user_info_response = app.client.users_info(user=user_id)
+                                        user_info = user_info_response.data
+                                        user_name = user_info["user"]["real_name"]
+                                        self.user_info_cache[user_id] = user_name
+                                    except SlackApiError:
+                                        pass
+                                else:
+                                    user_name = self.user_info_cache[user_id]
+                                    
+                            # Extract message metadata
+                            ts = float(msg["ts"])
+                            msg_datetime = datetime.fromtimestamp(ts)
+                            
+                            # Create structured message record
+                            msg_record = {
+                                "channel_id": channel_id,
+                                "channel_name": channel_name,
+                                "user_id": user_id,
+                                "user_name": user_name,
+                                "text": msg["text"],
+                                "timestamp": ts,
+                                "datetime": msg_datetime.isoformat(),
+                                "reactions": msg.get("reactions", []),
+                                "thread_ts": msg.get("thread_ts"),
+                                "replies": [],
+                                "files": []
+                            }
+                            
+                            # Process files if any
+                            if "files" in msg:
+                                for file_info in msg["files"]:
+                                    try:
+                                        file_record = self._process_file(file_info)
+                                        if file_record:
+                                            msg_record["files"].append(file_record)
+                                    except Exception as e:
+                                        logger.error(f"Error processing file during auto-update: {e}")
+                            
+                            # Handle thread replies
+                            if msg.get("reply_count", 0) > 0:
+                                try:
+                                    thread_response = app.client.conversations_replies(
+                                        channel=channel_id,
+                                        ts=msg["ts"]
+                                    )
+                                    thread = thread_response.data
+                                    
+                                    for reply in thread["messages"][1:]:  # Skip parent
+                                        reply_user_id = reply.get("user")
+                                        reply_user_name = "Unknown User"
+                                        
+                                        if reply_user_id:
+                                            if reply_user_id not in self.user_info_cache:
+                                                try:
+                                                    reply_user_info_response = app.client.users_info(user=reply_user_id)
+                                                    reply_user_info = reply_user_info_response.data
+                                                    reply_user_name = reply_user_info["user"]["real_name"]
+                                                    self.user_info_cache[reply_user_id] = reply_user_name
+                                                except SlackApiError:
+                                                    pass
+                                            else:
+                                                reply_user_name = self.user_info_cache[reply_user_id]
+                                        
+                                        reply_record = {
+                                            "user_id": reply_user_id,
+                                            "user_name": reply_user_name,
+                                            "text": reply.get("text", ""),
+                                            "timestamp": float(reply["ts"]),
+                                            "datetime": datetime.fromtimestamp(float(reply["ts"])).isoformat(),
+                                            "files": []
+                                        }
+                                        
+                                        # Process files in replies if any
+                                        if "files" in reply:
+                                            for file_info in reply["files"]:
+                                                try:
+                                                    file_record = self._process_file(file_info)
+                                                    if file_record:
+                                                        reply_record["files"].append(file_record)
+                                                except Exception as e:
+                                                    logger.error(f"Error processing file in reply during auto-update: {e}")
+                                        
+                                        msg_record["replies"].append(reply_record)
+                                except SlackApiError as e:
+                                    logger.error(f"Error fetching thread replies during auto-update: {e}")
+                            
+                            new_messages.append(msg_record)
+                        
+                        # Add the new messages to our existing ones
+                        if new_messages:
+                            self.channel_messages[channel_id].extend(new_messages)
+                            logger.info(f"Added {len(new_messages)} new messages to channel {channel_id}")
+                            total_new_messages += len(new_messages)
+                            channels_updated += 1
+                            
+                            # Update the last indexing time
+                            self.last_indexing[channel_id] = datetime.now().timestamp()
+                except Exception as e:
+                    logger.error(f"Error during auto-update for channel {channel_id}: {e}")
+            
+            # Save data if we've updated anything
+            if total_new_messages > 0:
+                self._save_data()
+                logger.info(f"Auto-update complete: indexed {total_new_messages} new messages across {channels_updated} channels")
+            
+            # Schedule next auto-reindex (every 15 minutes)
+            threading.Timer(900, auto_reindex).start()
+        
+        # Start initial timer for reindex after 5 minutes
+        threading.Timer(300, auto_reindex).start()
+        logger.info("Auto-reindex timer initialized (every 15 minutes)")
+    
+    def _load_data(self):
+        """Load previously saved message history if available."""
+        if MESSAGE_HISTORY_FILE.exists():
+            try:
+                with open(MESSAGE_HISTORY_FILE, 'rb') as f:
+                    saved_data = pickle.load(f)
+                    self.channel_messages = saved_data.get('channel_messages', {})
+                    self.last_indexing = saved_data.get('last_indexing', {})
+                    self.user_info_cache = saved_data.get('user_info_cache', {})
+                    self.document_cache = saved_data.get('document_cache', {})
+                    logger.info(f"Loaded message history for {len(self.channel_messages)} channels")
+            except Exception as e:
+                logger.error(f"Error loading message history: {e}")
+                # Create a backup of the corrupted file
+                if MESSAGE_HISTORY_FILE.exists():
+                    backup_file = MESSAGE_HISTORY_FILE.with_suffix('.bak')
+                    try:
+                        import shutil
+                        shutil.copy(MESSAGE_HISTORY_FILE, backup_file)
+                        logger.info(f"Created backup of corrupted data file: {backup_file}")
+                    except Exception as backup_error:
+                        logger.error(f"Failed to create backup: {backup_error}")
+    
+    def _save_data(self):
+        """Save current message history to disk."""
+        try:
+            # Create a temporary file first
+            temp_file = MESSAGE_HISTORY_FILE.with_suffix('.tmp')
+            with open(temp_file, 'wb') as f:
+                pickle.dump({
+                    'channel_messages': self.channel_messages,
+                    'last_indexing': self.last_indexing,
+                    'user_info_cache': self.user_info_cache,
+                    'document_cache': self.document_cache
+                }, f)
+            
+            # Rename the temp file to the actual file (atomic operation)
+            import os
+            if os.path.exists(MESSAGE_HISTORY_FILE):
+                os.replace(temp_file, MESSAGE_HISTORY_FILE)
+            else:
+                os.rename(temp_file, MESSAGE_HISTORY_FILE)
+                
+            logger.info("Message history saved successfully")
+        except Exception as e:
+            logger.error(f"Error saving message history: {e}")
+    
+    def _download_file(self, url):
+        """Download a file from Slack."""
+        try:
+            # Use Slack token for authentication
+            headers = {"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code == 200:
+                return response.content
+            else:
+                logger.error(f"Failed to download file: {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"Error downloading file: {e}")
+            return None
+    
+    def _process_file(self, file_info):
+        """Process and extract information from a file attached to a message."""
+        # Skip files that are too large
+        if file_info.get("size", 0) > MAX_DOCUMENT_SIZE:
+            logger.info(f"Skipping large file: {file_info.get('name', 'Unknown')} ({file_info.get('size', 0)} bytes)")
+            return None
+        
+        file_id = file_info.get("id")
+        file_name = file_info.get("name", "Unknown")
+        file_type = file_info.get("filetype", "unknown").lower()
+        file_url = file_info.get("url_private")
+        
+        if not file_url:
+            return None
+        
+        # Check if we've already processed this file
+        if file_id in self.document_cache:
+            logger.info(f"Using cached file content for {file_name}")
+            return self.document_cache[file_id]
+        
+        # Download the file
+        file_content = self._download_file(file_url)
+        if not file_content:
+            return None
+        
+        # Try to extract text content based on file type
+        extracted_text = None
+        file_extension = Path(file_name).suffix.lower()
+        
+        try:
+            # Process image files
+            if file_extension in ALLOWED_IMAGE_EXTENSIONS or file_type in ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff']:
+                extracted_text = DocumentProcessor.process_image(file_content)
+                
+            # Process PDF files
+            elif file_extension == '.pdf' or file_type == 'pdf':
+                extracted_text = DocumentProcessor.process_pdf(file_content)
+                
+            # Text files (just decode the content)
+            elif file_extension == '.txt' or file_type == 'text':
+                extracted_text = file_content.decode('utf-8', errors='replace')
+                
+            # Other document types (could add more handlers here)
+            else:
+                logger.info(f"Unsupported file type: {file_extension or file_type}")
+        except Exception as e:
+            logger.error(f"Error extracting text from file {file_name}: {e}")
+        
+        # Create file record
+        file_record = {
+            "id": file_id,
+            "name": file_name,
+            "type": file_type,
+            "size": file_info.get("size", 0),
+            "url": file_url,
+            "text_content": extracted_text
+        }
+        
+        # Cache the processed file
+        self.document_cache[file_id] = file_record
+        
+        return file_record
+    
+    def index_channel(self, channel_id, days_back=30):
+        """
+        Retrieve and index messages from a specific channel.
+        
+        Args:
+            channel_id: The Slack channel ID to index
+            days_back: How many days of history to fetch
+        """
+        logger.info(f"Indexing channel {channel_id}, {days_back} days back")
+        
+        # Calculate the oldest timestamp to fetch (in seconds since epoch)
+        oldest = datetime.now() - timedelta(days=days_back)
+        oldest_ts = oldest.timestamp()
+        logger.info(f"Will fetch messages newer than {oldest.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Initialize or reset channel messages
+        if channel_id not in self.channel_messages:
+            self.channel_messages[channel_id] = []
+            logger.info(f"Creating new channel entry for {channel_id}")
+        else:
+            old_count = len(self.channel_messages[channel_id])
+            logger.info(f"Clearing existing {old_count} messages for channel {channel_id}")
+            self.channel_messages[channel_id] = []
+        
+        try:
+            # Get channel info for context
+            channel_info_response = app.client.conversations_info(channel=channel_id)
+            channel_info = channel_info_response.data
+            channel_name = channel_info["channel"]["name"]
+            logger.info(f"Retrieved channel info: #{channel_name}")
+            
+            # Get channel messages with pagination
+            has_more = True
+            cursor = None
+            total_processed = 0
+            
+            while has_more:
+                try:
+                    logger.info(f"Fetching batch of messages from {channel_name} with cursor: {cursor}")
+                    result_response = app.client.conversations_history(
+                        channel=channel_id,
+                        cursor=cursor,
+                        limit=100,  # Slack API maximum
+                        oldest=str(oldest_ts)
+                    )
+                    result = result_response.data
+                    
+                    messages = result["messages"]
+                    batch_count = len(messages)
+                    logger.info(f"Retrieved {batch_count} messages in this batch")
+                    
+                    has_more = result["has_more"]
+                    cursor = result.get("response_metadata", {}).get("next_cursor")
+                    
+                    # Process and store messages
+                    valid_messages = 0
+                    for msg in messages:
+                        # Skip bot messages and non-text messages
+                        if msg.get("subtype") == "bot_message" or "text" not in msg:
+                            continue
+                        
+                        # Get user info for the message sender
+                        user_id = msg.get("user")
+                        user_name = "Unknown User"
+                        
+                        if user_id:
+                            if user_id not in self.user_info_cache:
+                                try:
+                                    user_info_response = app.client.users_info(user=user_id)
+                                    user_info = user_info_response.data
+                                    user_name = user_info["user"]["real_name"]
+                                    self.user_info_cache[user_id] = user_name
+                                except SlackApiError as e:
+                                    logger.error(f"Error fetching user info for {user_id}: {e}")
+                            else:
+                                user_name = self.user_info_cache[user_id]
+                        
+                        # Extract message metadata
+                        ts = float(msg["ts"])
+                        msg_datetime = datetime.fromtimestamp(ts)
+                        
+                        # Create structured message record
+                        msg_record = {
+                            "channel_id": channel_id,
+                            "channel_name": channel_name,
+                            "user_id": user_id,
+                            "user_name": user_name,
+                            "text": msg["text"],
+                            "timestamp": ts,
+                            "datetime": msg_datetime.isoformat(),
+                            "reactions": msg.get("reactions", []),
+                            "thread_ts": msg.get("thread_ts"),
+                            "replies": [],
+                            "files": []
+                        }
+                        
+                        # Process files if any
+                        if "files" in msg:
+                            for file_info in msg["files"]:
+                                try:
+                                    file_record = self._process_file(file_info)
+                                    if file_record:
+                                        msg_record["files"].append(file_record)
+                                except Exception as e:
+                                    logger.error(f"Error processing file: {e}")
+                        
+                        # If this is a threaded message, get the replies
+                        if "thread_ts" in msg and msg["thread_ts"] != msg["ts"]:
+                            # This is a reply, will be handled when processing the parent
+                            continue
+                        
+                        # Check if this message has replies (threads)
+                        if msg.get("reply_count", 0) > 0:
+                            try:
+                                thread_response = app.client.conversations_replies(
+                                    channel=channel_id,
+                                    ts=msg["ts"]
+                                )
+                                thread = thread_response.data
+                                
+                                # Skip the first message (it's the parent)
+                                thread_replies = 0
+                                for reply in thread["messages"][1:]:
+                                    reply_user_id = reply.get("user")
+                                    reply_user_name = "Unknown User"
+                                    
+                                    if reply_user_id:
+                                        if reply_user_id not in self.user_info_cache:
+                                            try:
+                                                reply_user_info_response = app.client.users_info(user=reply_user_id)
+                                                reply_user_info = reply_user_info_response.data
+                                                reply_user_name = reply_user_info["user"]["real_name"]
+                                                self.user_info_cache[reply_user_id] = reply_user_name
+                                            except SlackApiError:
+                                                pass
+                                        else:
+                                            reply_user_name = self.user_info_cache[reply_user_id]
+                                    
+                                    reply_record = {
+                                        "user_id": reply_user_id,
+                                        "user_name": reply_user_name,
+                                        "text": reply.get("text", ""),
+                                        "timestamp": float(reply["ts"]),
+                                        "datetime": datetime.fromtimestamp(float(reply["ts"])).isoformat(),
+                                        "files": []
+                                    }
+                                    
+                                    # Process files in replies if any
+                                    if "files" in reply:
+                                        for file_info in reply["files"]:
+                                            try:
+                                                file_record = self._process_file(file_info)
+                                                if file_record:
+                                                    reply_record["files"].append(file_record)
+                                            except Exception as e:
+                                                logger.error(f"Error processing file in reply: {e}")
+                                    
+                                    msg_record["replies"].append(reply_record)
+                                    thread_replies += 1
+                                
+                                logger.info(f"Added {thread_replies} replies to message from {user_name}")
+                            except SlackApiError as e:
+                                logger.error(f"Error fetching thread replies: {e}")
+                        
+                        # Add to channel messages
+                        self.channel_messages[channel_id].append(msg_record)
+                        valid_messages += 1
+                    
+                    total_processed += valid_messages
+                    logger.info(f"Processed {valid_messages} valid messages in this batch (total: {total_processed})")
+                    
+                    # Avoid rate limiting
+                    time.sleep(1)
+                
+                except SlackApiError as e:
+                    logger.error(f"Error fetching messages batch: {e}")
+                    has_more = False
+            
+            # Update last indexing time
+            current_time = datetime.now().timestamp()
+            self.last_indexing[channel_id] = current_time
+            logger.info(f"Updated last_indexing timestamp to {current_time} ({datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')})")
+            
+            # Save data after indexing
+            self._save_data()
+            logger.info(f"Indexing complete - saved {len(self.channel_messages[channel_id])} messages for channel {channel_name}")
+            
+            return len(self.channel_messages[channel_id])
+            
+        except SlackApiError as e:
+            logger.error(f"Error indexing channel {channel_id}: {e}")
+            return 0
+    
+    def _is_followup_question(self, current_query, previous_query):
+        """Determine if the current query is a follow-up to the previous one."""
+        # Simple heuristics to detect follow-up questions
+        
+        # Check for pronouns referring to previous entities
+        pronouns = ["it", "they", "them", "this", "that", "these", "those", "he", "she"]
+        if any(current_query.lower().startswith(p + " ") for p in pronouns):
+            return True
+            
+        # Check for very short queries that depend on context
+        if len(current_query.split()) <= 3:
+            return True
+            
+        # Check for queries that start with "and", "or", "but", etc.
+        connectors = ["and", "or", "but", "also", "what about", "how about"]
+        if any(current_query.lower().startswith(c + " ") for c in connectors):
+            return True
+            
+        return False
+    
+    def get_channel_context(self, channel_id: str, query: str, max_messages: int = 100) -> str:
+        """
+        Retrieve relevant context from a channel based on a query.
+        
+        Args:
+            channel_id: The Slack channel ID to search
+            query: The user's question/query
+            max_messages: Maximum number of messages to include in context
+            
+        Returns:
+            String containing relevant context for the query
+        """
+        if channel_id not in self.channel_messages or not self.channel_messages[channel_id]:
+            return "No messages found for this channel. Try indexing it first."
+        
+        # Log the query and channel for debugging
+        logger.info(f"Searching in channel {channel_id} for query: {query}")
+        logger.info(f"Channel has {len(self.channel_messages[channel_id])} messages indexed")
+        
+        # For a more sophisticated approach, combine keyword matching with semantic relevance
+        keywords = self._extract_keywords(query)
+        logger.info(f"Extracted keywords: {keywords}")
+        
+        scored_messages = []
+        
+        # Create a clean version of the query for comparison
+        clean_query = re.sub(r'[^\w\s]', '', query.lower())
+        query_words = set(clean_query.split())
+        
+        for msg in self.channel_messages[channel_id]:
+            score = 0
+            msg_text = msg["text"].lower()
+            clean_msg_text = re.sub(r'[^\w\s]', '', msg_text)
+            msg_words = set(clean_msg_text.split())
+            
+            # Score based on keyword presence
+            for keyword in keywords:
+                if keyword in msg_text:
+                    score += 2  # Higher weight for exact keyword matches
+            
+            # Add score based on word overlap ratio
+            if query_words and msg_words:
+                overlap = len(query_words.intersection(msg_words))
+                overlap_ratio = overlap / len(query_words)
+                score += overlap_ratio * 3  # Scale the ratio
+            
+            # Add more weight to recent messages
+            recency_score = 0
+            if (datetime.now().timestamp() - msg["timestamp"]) < (7 * 24 * 60 * 60):  # 7 days
+                recency_score = 1  # Higher weight for recent messages
+                score += recency_score
+                
+            # Add code metadata and links with higher weight
+            if "```" in msg["text"] or "`" in msg["text"]:
+                score += 1.5  # Higher weight for code snippets
+                
+            # Consider message length - longer messages might contain more information
+            if len(msg["text"]) > 300:
+                score += 0.5  # Slightly boost detailed messages
+            
+            # Higher score for messages with links, as they often contain important information
+            if "http" in msg_text or "<http" in msg_text:
+                score += 0.5
+                
+            # Higher score for messages that mention users, as they might be assignments or important callouts
+            if "<@" in msg["text"]:
+                score += 0.5
+                
+            # Higher score for messages with reactions, as they might be important
+            if msg.get("reactions") and len(msg.get("reactions", [])) > 0:
+                score += len(msg.get("reactions", [])) * 0.3
+            
+            # Score files based on content
+            for file in msg.get("files", []):
+                if file.get("text_content"):
+                    file_text = file.get("text_content", "").lower()
+                    
+                    # Score based on keyword presence in file content
+                    for keyword in keywords:
+                        if keyword in file_text:
+                            score += 2  # Higher weight for file content matches
+                    
+                    # Score based on word overlap in file content
+                    clean_file_text = re.sub(r'[^\w\s]', '', file_text)
+                    file_words = set(clean_file_text.split())
+                    if query_words and file_words:
+                        file_overlap = len(query_words.intersection(file_words))
+                        file_overlap_ratio = file_overlap / len(query_words)
+                        score += file_overlap_ratio * 4  # Higher weight for file content
+            
+            # Higher score for messages with replies (threads), as they generate discussion
+            if len(msg.get("replies", [])) > 0:
+                score += len(msg.get("replies", [])) * 0.4
+                
+                # Also score the replies
+                for reply in msg["replies"]:
+                    reply_score = 0
+                    reply_text = reply["text"].lower()
+                    
+                    # Score based on keyword presence in replies
+                    for keyword in keywords:
+                        if keyword in reply_text:
+                            reply_score += 1
+                    
+                    # Add score based on word overlap ratio in replies
+                    clean_reply_text = re.sub(r'[^\w\s]', '', reply_text)
+                    reply_words = set(clean_reply_text.split())
+                    if query_words and reply_words:
+                        reply_overlap = len(query_words.intersection(reply_words))
+                        reply_overlap_ratio = reply_overlap / len(query_words)
+                        reply_score += reply_overlap_ratio * 2
+                    
+                    # Score files in replies
+                    for file in reply.get("files", []):
+                        if file.get("text_content"):
+                            file_text = file.get("text_content", "").lower()
+                            
+                            # Score based on keyword presence in file content
+                            for keyword in keywords:
+                                if keyword in file_text:
+                                    reply_score += 1.5
+                    
+                    # Replies with higher scores increase the parent message score
+                    if reply_score > 0:
+                        score += reply_score * 0.7  # Scale down reply contributions
+            
+            if score > 0:
+                scored_messages.append((score, msg))
+        
+        # Sort by score (highest first)
+        scored_messages.sort(reverse=True, key=lambda x: x[0])
+        
+        # Log top scores for debugging
+        if scored_messages:
+            logger.info(f"Top message score: {scored_messages[0][0]}")
+        else:
+            logger.info("No relevant messages found")
+        
+        # Limit to max_messages
+        top_messages = scored_messages[:max_messages]
+        
+        # Format messages for context
+        context_parts = []
+        
+        for _, msg in top_messages:
+            try:
+                # Format the timestamp as a readable date
+                time_str = datetime.fromisoformat(msg["datetime"]).strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Add the message with user name
+                message_text = f"{time_str} - {msg['user_name']}: {msg['text']}"
+                context_parts.append(message_text)
+                
+                # Include file contents if any
+                for file in msg.get("files", []):
+                    if file.get("text_content"):
+                        file_text = f"  📄 {file.get('name')}: {file.get('text_content', '')[:500]}"
+                        if len(file.get('text_content', '')) > 500:
+                            file_text += " [content truncated]"
+                        context_parts.append(file_text)
+                
+                # Include replies if any
+                for reply in msg["replies"]:
+                    reply_time = datetime.fromisoformat(reply["datetime"]).strftime("%Y-%m-%d %H:%M:%S")
+                    reply_text = f"  └ {reply_time} - {reply['user_name']}: {reply['text']}"
+                    context_parts.append(reply_text)
+                    
+                    # Include file contents in replies if any
+                    for file in reply.get("files", []):
+                        if file.get("text_content"):
+                            file_text = f"    📄 {file.get('name')}: {file.get('text_content', '')[:500]}"
+                            if len(file.get('text_content', '')) > 500:
+                                file_text += " [content truncated]"
+                            context_parts.append(file_text)
+            except Exception as e:
+                logger.error(f"Error formatting message: {e}")
+                # Add a basic version of the message if formatting fails
+                context_parts.append(f"Message from {msg.get('user_name', 'Unknown')}: {msg.get('text', 'No text')}")
+        
+        if not context_parts:
+            # If no directly relevant messages found, include some recent messages for context
+            logger.info("No relevant messages found, including some recent messages")
+            sorted_msgs = sorted(self.channel_messages[channel_id], 
+                                key=lambda x: x["timestamp"], 
+                                reverse=True)[:10]
+            
+            for msg in sorted_msgs:
+                try:
+                    time_str = datetime.fromisoformat(msg["datetime"]).strftime("%Y-%m-%d %H:%M:%S")
+                    message_text = f"{time_str} - {msg['user_name']}: {msg['text']}"
+                    context_parts.append(message_text)
+                except Exception as e:
+                    logger.error(f"Error formatting recent message: {e}")
+            
+            if context_parts:
+                context_parts.insert(0, "I couldn't find messages directly related to your question, but here are some recent messages from the channel:")
+            else:
+                return "I couldn't find any relevant messages for your query in this channel."
+        
+        # Join all parts with newlines
+        return "\n".join(context_parts)
+    
+    def _extract_keywords(self, text: str) -> List[str]:
+        """Extract keywords from text for basic search."""
+        # Remove punctuation and convert to lowercase
+        text = re.sub(r'[^\w\s]', '', text.lower())
+        
+        # Split into words
+        words = text.split()
+        
+        # Filter out common stop words (simplified)
+        stop_words = {"a", "an", "the", "in", "on", "at", "to", "for", "with", "by", "about", "like", "through", "over", "before", "between", "after", "since", "without", "under", "within", "along", "following", "across", "behind", "beyond", "plus", "except", "but", "up", "out", "around", "down", "off", "above", "near", "and", "or", "if", "then", "else", "when", "where", "why", "how", "all", "any", "both", "each", "few", "more", "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now", "d", "ll", "m", "o", "re", "ve", "y", "ain", "aren", "couldn", "didn", "doesn", "hadn", "hasn", "haven", "isn", "ma", "mightn", "mustn", "needn", "shan", "shouldn", "wasn", "weren", "won", "wouldn"}
+        
+        keywords = [word for word in words if word not in stop_words and len(word) > 2]
+        
+        # Add synonym expansion
+        expanded_keywords = []
+        for keyword in keywords:
+            # Add common technical synonyms
+            if keyword == "error":
+                expanded_keywords.extend(["exception", "bug", "issue", "problem"])
+            elif keyword == "deploy":
+                expanded_keywords.extend(["release", "publish", "launch", "push"])
+            elif keyword == "feature":
+                expanded_keywords.extend(["functionality", "capability"])
+            elif keyword == "info" or keyword == "information":
+                expanded_keywords.extend(["details", "data", "specifics"])
+        
+        keywords.extend(expanded_keywords)
+        return keywords
+    
+    def _should_use_llm_knowledge(self, query):
+        """Determine if the bot should use its built-in LLM knowledge for this query."""
+        # Check if the query appears to be asking for general knowledge
+        general_knowledge_indicators = [
+            "what is", "how does", "explain", "definition", "concept of", 
+            "tell me about", "describe", "history of", "background on",
+            "principles of", "theory of", "fundamentals of"
+        ]
+        
+        # Check for technical questions that might benefit from LLM knowledge
+        technical_indicators = [
+            "code", "programming", "algorithm", "function", "library", 
+            "framework", "syntax", "best practice", "pattern", "architecture"
+        ]
+        
+        # Check for questions that likely need both channel context and LLM knowledge
+        mixed_indicators = [
+            "compare", "difference between", "better approach", 
+            "alternatives to", "pros and cons", "recommendation"
+        ]
+        
+        # Determine if query matches any indicators
+        query_lower = query.lower()
+        
+        is_general_knowledge = any(indicator in query_lower for indicator in general_knowledge_indicators)
+        is_technical = any(indicator in query_lower for indicator in technical_indicators)
+        is_mixed = any(indicator in query_lower for indicator in mixed_indicators)
+        
+        # If it's a mixed query or general knowledge, use LLM knowledge
+        if is_mixed or is_general_knowledge or is_technical:
+            return True
+        
+        # Otherwise, rely on channel data
+        return False
+    
+    def answer_query(self, channel_id, query):
+        """
+        Generate an answer to a user query based on channel context and LLM knowledge.
+        
+        Args:
+            channel_id: The Slack channel ID
+            query: The user's question
+            
+        Returns:
+            A response to the question based on available context and LLM knowledge
+        """
+        # Get relevant context
+        context = self.get_channel_context(channel_id, query)
+        
+        if context.startswith("No messages found for this channel"):
+            # If no channel data, check if we should use LLM knowledge
+            if self._should_use_llm_knowledge(query):
+                return self._generate_llm_answer(query)
+            return context
+        
+        # Check if this is a follow-up question
+        if channel_id in self.last_query and self._is_followup_question(query, self.last_query[channel_id]):
+            logger.info(f"Detected follow-up question. Previous: '{self.last_query[channel_id]}', Current: '{query}'")
+            # Combine previous context with new context
+            if channel_id in self.last_context:
+                previous_context = self.last_context[channel_id]
+                logger.info(f"Adding previous context ({len(previous_context.split('\n'))} lines)")
+                context = previous_context + "\n\n" + context
+        
+        # Store the current query and context for potential follow-ups
+        self.last_query[channel_id] = query
+        self.last_context[channel_id] = context
+        
+        # Log debugging info
+        logger.info(f"Query: {query}")
+        logger.info(f"Context length: {len(context.split('\n'))} messages")
+        if context.split('\n'):
+            logger.info(f"First few context messages: {context.split('\n')[:3]}")
+        
+        # Check if we should use LLM knowledge
+        use_llm = self._should_use_llm_knowledge(query)
+        
+        try:
+            # First, check if the channel has a name
+            channel_name = "this channel"
+            try:
+                channel_info_response = app.client.conversations_info(channel=channel_id)
+                channel_info = channel_info_response.data
+                if channel_info and "channel" in channel_info and "name" in channel_info["channel"]:
+                    channel_name = f"#{channel_info['channel']['name']}"
+            except Exception as e:
+                logger.error(f"Error getting channel name: {e}")
+            
+            # Different system prompt based on whether to use LLM knowledge
+            if use_llm:
+                system_prompt = "You are a helpful Slack assistant that responds naturally and conversationally, as if you're a knowledgeable team member. Your task is to provide accurate, comprehensive answers based on both the Slack conversation history provided AND your own built-in knowledge as an AI assistant. Use your knowledge to fill in gaps, provide context, and enhance your answers when appropriate."
+            else:
+                system_prompt = "You are a helpful Slack assistant that responds naturally and conversationally, as if you're a knowledgeable team member. Your task is to provide accurate, comprehensive answers based ONLY on the Slack conversation history provided. Be thorough in your search for information - check timestamps, usernames, and all details in the messages."
+            
+            user_prompt = f"""You have access to messages from {channel_name} and need to answer a question based on them.
+Use a natural, helpful, and conversational tone in your response.
+{"You should use both the channel message history AND your own knowledge as an AI assistant to provide the most helpful answer." if use_llm else "Base your answer solely on the information in the channel messages."}
+If the exact answer cannot be determined from the messages, {"offer your best answer based on your knowledge, but indicate when you're using your own knowledge rather than channel information." if use_llm else "offer your best guess based on the available information, but be transparent about your uncertainty."}
+If the information is completely absent {"from both the messages and your knowledge, say so honestly." if use_llm else "from the messages, say so honestly but check if there's any related information that might still be helpful."}
+
+Here are the relevant Slack messages:
+{context}
+
+Question: {query}
+
+When answering:
+1. Be concise but thorough and helpful
+2. Use a casual, friendly tone like a helpful colleague would
+3. If multiple people mentioned different things, summarize the different perspectives
+4. If relevant, mention specific people's names when attributing information
+5. Include timestamps when they might be important to the answer
+6. If the answer might be found in a link or attachment mentioned in the messages, note that
+{"7. When you need to supplement with your own knowledge, clearly distinguish between information from the channel and your added context/knowledge" if use_llm else ""}
+"""
+            
+            # Make API call to OpenAI
+            response = openai.chat.completions.create(
+                model="gpt-4",  # or gpt-3.5-turbo
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.5,
+                max_tokens=800
+            )
+            
+            answer = response.choices[0].message.content.strip()
+            
+            # Check if the answer indicates no information
+            no_info_phrases = [
+                "i don't have enough information",
+                "i cannot find any information",
+                "i don't see any information",
+                "no information about",
+                "no specific information",
+                "no relevant information",
+                "no data regarding",
+                "no mention of",
+                "not mentioned in",
+                "not discussed in"
+            ]
+            
+            # If no relevant information was found and we didn't use LLM knowledge
+            if any(phrase in answer.lower() for phrase in no_info_phrases) and not use_llm:
+                # Try using LLM knowledge
+                logger.info("No relevant information found in channel, trying LLM knowledge")
+                return self._generate_llm_answer(query)
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating answer: {e}")
+            return f"I encountered an issue while searching for information about '{query}'. Please try asking a different question or ask me to re-index the channel."
+    
+    def _generate_llm_answer(self, query):
+        """Generate an answer using only the LLM's built-in knowledge."""
+        try:
+            system_prompt = """You are a helpful Slack assistant with extensive knowledge on a wide range of topics. 
+When answering questions, use your built-in knowledge to provide accurate, helpful, and concise responses.
+Your tone should be conversational and natural, as if you're a knowledgeable team member having a chat."""
+            
+            response = openai.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ],
+                temperature=0.7,
+                max_tokens=800
+            )
+            
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Error generating LLM answer: {e}")
+            return f"I'm not able to answer that question at the moment. Please try again later."
+    
+    def generate_document(self, channel_id, query):
+        """Generate a document based on channel context and query."""
+        # First get an answer to the query
+        answer = self.answer_query(channel_id, query)
+        
+        logger.info(f"Generating document for query: {query}")
+        logger.info(f"Answer length: {len(answer)} characters")
+        
+        # Determine document type from query
+        if "pdf" in query.lower():
+            # Generate PDF
+            try:
+                pdf_data = DocumentProcessor.generate_pdf(answer, f"Response to: {query}")
+                if pdf_data:
+                    logger.info(f"Successfully generated PDF ({len(pdf_data)} bytes)")
+                    return {
+                        "type": "pdf",
+                        "data": base64.b64encode(pdf_data).decode('utf-8'),
+                        "filename": f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                    }
+                else:
+                    logger.error("PDF generation returned None")
+                    return None
+            except Exception as e:
+                logger.error(f"Error in PDF generation: {e}", exc_info=True)
+                return None
+        elif "chart" in query.lower() or "graph" in query.lower():
+            # Extract data for chart
+            try:
+                # Use the LLM to extract structured data from the answer
+                system_prompt = """You are a data extraction assistant. Extract structured data from the following text
+that could be used to create a simple chart. Return only a JSON object with labels as keys and numeric values.
+If you can't find numeric data, create a simple example with fictional data based on the text content."""
+                
+                response = openai.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": answer}
+                    ],
+                    temperature=0.3,
+                    max_tokens=500
+                )
+                
+                # Parse the JSON response
+                import json
+                chart_data = json.loads(response.choices[0].message.content.strip())
+                
+                # Generate chart image
+                chart_type = "bar"
+                if "pie" in query.lower():
+                    chart_type = "pie"
+                elif "line" in query.lower():
+                    chart_type = "line"
+                
+                chart_image = DocumentProcessor.generate_chart(
+                    chart_data, 
+                    f"Chart: {query}",
+                    chart_type
+                )
+                
+                if chart_image:
+                    logger.info(f"Successfully generated chart ({len(chart_image)} bytes)")
+                    return {
+                        "type": "image",
+                        "data": base64.b64encode(chart_image).decode('utf-8'),
+                        "filename": f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                    }
+                else:
+                    logger.error("Chart generation returned None")
+                    return None
+            except Exception as e:
+                logger.error(f"Error generating chart: {e}", exc_info=True)
+                # Fall back to PDF
+                try:
+                    pdf_data = DocumentProcessor.generate_pdf(answer, f"Response to: {query}")
+                    if pdf_data:
+                        logger.info(f"Falling back to PDF generation ({len(pdf_data)} bytes)")
+                        return {
+                            "type": "pdf",
+                            "data": base64.b64encode(pdf_data).decode('utf-8'),
+                            "filename": f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                        }
+                    else:
+                        logger.error("Fallback PDF generation returned None")
+                        return None
+                except Exception as pdf_e:
+                    logger.error(f"Error in fallback PDF generation: {pdf_e}")
+                    return None
+        else:
+            # Default to PDF
+            try:
+                pdf_data = DocumentProcessor.generate_pdf(answer, f"Response to: {query}")
+                if pdf_data:
+                    logger.info(f"Successfully generated default PDF ({len(pdf_data)} bytes)")
+                    return {
+                        "type": "pdf",
+                        "data": base64.b64encode(pdf_data).decode('utf-8'),
+                        "filename": f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                    }
+                else:
+                    logger.error("Default PDF generation returned None")
+                    return None
+            except Exception as e:
+                logger.error(f"Error in default PDF generation: {e}")
+                return None
+            
+# Slack event handlers
+@app.event("app_mention")
+def handle_mention(event, say):
+    """Handle when the bot is mentioned in a channel."""
+    channel_id = event["channel"]
+    text = event["text"]
+    user = event["user"]
+    
+    # Extract the query (remove the mention part)
+    query = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
+    
+    # Add this right after the query extraction
+    logger.info(f"Received mention with query: '{query}'")
+    
+    # Initialize bot if not already done
+    if not hasattr(app, "knowledge_bot"):
+        app.knowledge_bot = SlackKnowledgeBot()
+    
+    # Check for commands
+    if query.lower().startswith("index") or query.lower().startswith("update"):
+        # And add this detailed logging for index commands
+        logger.info(f"INDEX COMMAND DETECTED: {query}")
+        
+        days = 30  # Default
+        
+        # Try to extract number of days
+        match = re.search(r'(\d+)\s*days?', query)
+        if match:
+            days = int(match.group(1))
+            
+        # Acknowledge receipt of command with a reaction
+        try:
+            app.client.reactions_add(
+                channel=channel_id,
+                timestamp=event["ts"],
+                name="eyes"  # 👀 reaction
+            )
+        except Exception as e:
+            logger.error(f"Error adding reaction: {e}")
+        
+        say(f"I'll start indexing this channel (going back {days} days). This might take a little while...")
+        
+        # Use a separate thread to run the async operation
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor()
+        
+        def run_indexing():
+            try:
+                num_messages = app.knowledge_bot.index_channel(channel_id, days)
+                logger.info(f"Indexing completed via thread: {num_messages} messages")
+                
+                # Add a reaction to indicate completion
+                try:
+                    app.client.reactions_add(
+                        channel=channel_id,
+                        timestamp=event["ts"],
+                        name="white_check_mark"  # ✅ reaction
+                    )
+                except Exception as e:
+                    logger.error(f"Error adding completion reaction: {e}")
+                
+                if num_messages > 0:
+                    say(f"All done! I've processed {num_messages} messages from the past {days} days. You can now ask me questions about this channel.")
+                else:
+                    say(f"Indexing completed, but I didn't find any messages to process. This could be because the channel is empty or I don't have permission to see the messages.")
+            except Exception as e:
+                logger.error(f"Error during indexing: {e}")
+                say(f"I encountered an error while trying to index this channel: {str(e)}")
+        
+        executor.submit(run_indexing)
+    
+    elif query.lower() == "help":
+        help_text = """
+Hey there! 👋 I'm your enhanced Slack Knowledge Bot. Here's how I can help:
+
+- `@bot index` - I'll grab the last 30 days of messages in this channel
+- `@bot index 60 days` - Need more history? I can go back further!
+- Just ask me questions like: `@bot who's working on the API project?`
+- Or: `@bot when was the last deployment?`
+- I can also answer general questions using my built-in knowledge
+- I can process images and PDFs shared in the channel
+- Try `@bot generate a pdf about [topic]` or `@bot create a chart showing [data]`
+
+I'll search through the indexed messages and use my knowledge to find you answers!
+        """
+        say(help_text)
+    
+    elif query.lower().startswith("generate") or query.lower().startswith("create"):
+        # Handle document generation
+        generation_query = query[query.find(" ") + 1:].strip()
+        
+        # Quick reaction to acknowledge
+        try:
+            app.client.reactions_add(
+                channel=channel_id,
+                timestamp=event["ts"],
+                name="hourglass"  # ⌛ reaction
+            )
+        except Exception as e:
+            logger.error(f"Error adding reaction: {e}")
+        
+        say("I'll generate that document for you. This might take a moment...")
+        
+        # Use a separate thread for generation
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor()
+        
+        def run_generation():
+            try:
+                document = app.knowledge_bot.generate_document(channel_id, generation_query)
+                
+                if document is None:
+                    say("I encountered an error while generating your document. Please try a different query or format.")
+                    return
+                    
+                # Change reaction to indicate completion
+                try:
+                    # Remove hourglass
+                    app.client.reactions_remove(
+                        channel=channel_id,
+                        timestamp=event["ts"],
+                        name="hourglass"
+                    )
+                    # Add completion reaction
+                    app.client.reactions_add(
+                        channel=channel_id,
+                        timestamp=event["ts"],
+                        name="page_facing_up"  # 📄 reaction
+                    )
+                except Exception as e:
+                    logger.error(f"Error changing reactions: {e}")
+                
+                # Upload the document
+                try:
+                    # Create temp file with proper extension
+                    file_extension = document["filename"].split('.')[-1]
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as temp:
+                        temp.write(base64.b64decode(document["data"]))
+                        temp_path = temp.name
+                        
+                    logger.info(f"Created temporary file at {temp_path} for upload")
+                    
+                    # Explicitly log file size and existence to help debug
+                    file_size = os.path.getsize(temp_path)
+                    logger.info(f"Temporary file size: {file_size} bytes")
+                    
+                    if file_size == 0:
+                        raise ValueError("Generated file is empty (0 bytes)")
+                        
+                    # Upload to Slack using files.upload for better compatibility
+                    upload_response = app.client.files_upload(
+                        channels=channel_id,
+                        file=temp_path,
+                        filename=document["filename"],
+                        title=f"Generated document for: {generation_query[:40]}..."
+                    )
+                    
+                    # Log the successful upload response
+                    logger.info(f"File upload successful: {upload_response}")
+                    
+                    # Delete temp file
+                    os.unlink(temp_path)
+                    
+                    say(f"Here's the document you requested based on my knowledge of the channel and your query.")
+                except Exception as e:
+                    logger.error(f"Error uploading document: {e}", exc_info=True)
+                    # Try alternative upload method
+                    try:
+                        logger.info("Trying alternative upload method")
+                        with open(temp_path, 'rb') as file_content:
+                            upload_response = app.client.files_upload_v2(
+                                channel=channel_id,
+                                file=file_content,
+                                filename=document["filename"],
+                                title=f"Generated document for: {generation_query[:40]}..."
+                            )
+                        os.unlink(temp_path)
+                        say(f"Here's the document you requested.")
+                    except Exception as alt_e:
+                        logger.error(f"Alternative upload method also failed: {alt_e}")
+                        say("I generated the document but encountered an error when trying to upload it. Please try again with a simpler query.")
+            
+            except Exception as e:
+                logger.error(f"Error generating document: {e}", exc_info=True)
+                say(f"I encountered an error while trying to generate your document. Please try again with a different query.")
+        
+        executor.submit(run_generation)
+    
+    elif query.lower().startswith("debug "):
+        # Special command for debugging
+        actual_query = query[6:].strip()
+        context = app.knowledge_bot.get_channel_context(channel_id, actual_query)
+        message_count = len(context.split('\n'))
+        context_summary = f"Found {message_count} relevant messages for your query."
+        first_few = "\n".join(context.split('\n')[:5]) if message_count > 0 else "No messages found."
+        say(f"Debug info for query: '{actual_query}'\n{context_summary}\n\nFirst few messages:\n{first_few}")
+    
+    else:
+        # Quick reaction to acknowledge
+        try:
+            app.client.reactions_add(
+                channel=channel_id,
+                timestamp=event["ts"],
+                name="thinking_face"  # 🤔 reaction
+            )
+        except Exception as e:
+            logger.error(f"Error adding thinking reaction: {e}")
+            
+        # Treat as a query
+        if channel_id not in app.knowledge_bot.channel_messages:
+            say("I don't have any information about this channel yet. Let me index it first - just say `@bot index`")
+            return
+            
+        if len(app.knowledge_bot.channel_messages[channel_id]) < 5:
+            say("I've only indexed a few messages in this channel. If you don't get good answers, try `@bot index 60 days` to get more history.")
+        
+        # Check if indexing is too old (7 days)
+        last_indexed = app.knowledge_bot.last_indexing.get(channel_id, 0)
+        days_since_indexed = 0
+        if last_indexed > 0:  # Only calculate if we have a valid timestamp
+            days_since_indexed = (datetime.now().timestamp() - last_indexed) / (60 * 60 * 24)
+            # Add sanity check to avoid unreasonable values
+            if days_since_indexed < 0 or days_since_indexed > 1000:
+                logger.error(f"Invalid days_since_indexed: {days_since_indexed}, resetting to 0")
+                days_since_indexed = 0
+                # Fix the timestamp
+                app.knowledge_bot.last_indexing[channel_id] = datetime.now().timestamp()
+                app.knowledge_bot._save_data()
+
+        if days_since_indexed > 7:
+            say(f"_Just so you know, my data is {int(days_since_indexed)} days old. You might want to ask me to `re-index` for the latest info._")
+        
+        # Changed this line to use the varied messages
+        say(generate_search_message(query))
+        
+        # Use a separate thread to run the async operation
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor()
+        
+        def run_query():
+            try:
+                answer = app.knowledge_bot.answer_query(channel_id, query)
+                
+                # Change reaction to indicate completion
+                try:
+                    # Remove thinking face
+                    app.client.reactions_remove(
+                        channel=channel_id,
+                        timestamp=event["ts"],
+                        name="thinking_face"
+                    )
+                    # Add completion reaction
+                    app.client.reactions_add(
+                        channel=channel_id,
+                        timestamp=event["ts"],
+                        name="bulb"  # 💡 reaction 
+                    )
+                except Exception as e:
+                    logger.error(f"Error changing reactions: {e}")
+                
+                say(answer)
+            except Exception as e:
+                logger.error(f"Error processing query: {e}")
+                say("I encountered an error while trying to answer your question. Please try again or ask a different question.")
+        
+        executor.submit(run_query)
+
+
+@app.event("message")
+def handle_message(event):
+    """Handle direct messages to the bot."""
+    # Only process direct messages
+    if event.get("channel_type") == "im":
+        channel_id = event["channel"]
+        text = event["text"]
+        user = event["user"]
+        
+        # Initialize bot if not already done
+        if not hasattr(app, "knowledge_bot"):
+            app.knowledge_bot = SlackKnowledgeBot()
+        
+        # Process DM commands here
+        if text.lower() == "help":
+            help_text = """
+I'm an enhanced Slack Knowledge Bot that helps you query channel history and more. In DMs, you can:
+- Type `help` - Show this help message
+- Type `list channels` - Show channels I've indexed
+- Type `query #channel-name your question` - Ask me about a specific channel
+- Type `generate pdf about [topic]` - I'll create a PDF document
+- Type `create chart for [data]` - I'll generate a chart or graph
+            """
+            app.client.chat_postMessage(channel=channel_id, text=help_text)
+        
+        elif text.lower() == "list channels":
+            # List indexed channels
+            if not app.knowledge_bot.channel_messages:
+                app.client.chat_postMessage(
+                    channel=channel_id, 
+                    text="I haven't indexed any channels yet."
+                )
+                return
+            
+            # Use a separate thread to run the async operation
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor()
+            
+            def run_list_channels():
+                channel_info = []
+                for ch_id in app.knowledge_bot.channel_messages:
+                    try:
+                        info_response = app.client.conversations_info(channel=ch_id)
+                        info = info_response.data
+                        name = info["channel"]["name"]
+                        msg_count = len(app.knowledge_bot.channel_messages[ch_id])
+                        last_update = datetime.fromtimestamp(app.knowledge_bot.last_indexing.get(ch_id, 0))
+                        channel_info.append(f"• #{name}: {msg_count} messages, last updated {last_update.strftime('%Y-%m-%d')}")
+                    except Exception as e:
+                        logger.error(f"Error getting channel info: {e}")
+                        channel_info.append(f"• Unknown channel ({ch_id}): {len(app.knowledge_bot.channel_messages[ch_id])} messages")
+                
+                app.client.chat_postMessage(
+                    channel=channel_id, 
+                    text="Indexed channels:\n" + "\n".join(channel_info)
+                )
+            
+            executor.submit(run_list_channels)
+        
+        elif text.lower().startswith("query "):
+            # Extract channel and query
+            parts = text[6:].strip().split(" ", 1)
+            if len(parts) < 2:
+                app.client.chat_postMessage(
+                    channel=channel_id, 
+                    text="Please specify both a channel and a query, e.g., `query #general when did we deploy the new version?`"
+                )
+                return
+            
+            ch_name, query = parts
+            # Remove the # from channel name if present
+            ch_name = ch_name.lstrip("#")
+            
+            # Use a separate thread to run the async operation
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor()
+            
+            def run_query():
+                try:
+                    result_response = app.client.conversations_list(types="public_channel,private_channel")
+                    result = result_response.data
+                    target_channel = None
+                    
+                    for channel in result["channels"]:
+                        if channel["name"] == ch_name:
+                            target_channel = channel["id"]
+                            break
+                    
+                    if not target_channel:
+                        app.client.chat_postMessage(
+                            channel=channel_id, 
+                            text=f"I couldn't find a channel named #{ch_name}"
+                        )
+                        return
+                    
+                    # Process the query
+                    if target_channel not in app.knowledge_bot.channel_messages:
+                        app.client.chat_postMessage(
+                            channel=channel_id, 
+                            text=f"I haven't indexed #{ch_name} yet. Please mention me in that channel and ask me to 'index' it first."
+                        )
+                        return
+                    
+                    app.client.chat_postMessage(
+                        channel=channel_id, 
+                        text=generate_search_message(query)
+                    )
+                    
+                    answer = app.knowledge_bot.answer_query(target_channel, query)
+                    app.client.chat_postMessage(channel=channel_id, text=answer)
+                    
+                except Exception as e:
+                    logger.error(f"Error in DM query: {e}")
+                    app.client.chat_postMessage(
+                        channel=channel_id, 
+                        text=f"Sorry, I encountered an error: {str(e)}"
+                    )
+            
+            executor.submit(run_query)
+        
+        elif text.lower().startswith("generate ") or text.lower().startswith("create "):
+            # Extract document generation query
+            generation_query = text[text.find(" ") + 1:].strip()
+            
+            app.client.chat_postMessage(
+                channel=channel_id, 
+                text="I'll create that document for you based on my knowledge. This might take a moment..."
+            )
+            
+            # Use a separate thread for document generation
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor()
+            
+            def run_generation():
+                try:
+                    # Generate document using LLM knowledge only
+                    answer = app.knowledge_bot._generate_llm_answer(generation_query)
+                    
+                    # Determine document type
+                    if "pdf" in generation_query.lower():
+                        # Generate PDF
+                        pdf_data = DocumentProcessor.generate_pdf(answer, f"Response to: {generation_query}")
+                        document = {
+                            "type": "pdf",
+                            "data": base64.b64encode(pdf_data).decode('utf-8'),
+                            "filename": f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                        }
+                    elif "chart" in generation_query.lower() or "graph" in generation_query.lower():
+                        # Try to extract structured data for chart
+                        try:
+                            system_prompt = """You are a data extraction assistant. Extract structured data from the following text
+that could be used to create a simple chart. Return only a JSON object with labels as keys and numeric values."""
+                            
+                            response = openai.chat.completions.create(
+                                model="gpt-4",
+                                messages=[
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": answer}
+                                ],
+                                temperature=0.3,
+                                max_tokens=500
+                            )
+                            
+                            # Parse the JSON response
+                            import json
+                            chart_data = json.loads(response.choices[0].message.content.strip())
+                            
+                            # Generate chart
+                            chart_type = "bar"
+                            if "pie" in generation_query.lower():
+                                chart_type = "pie"
+                            elif "line" in generation_query.lower():
+                                chart_type = "line"
+                            
+                            chart_image = DocumentProcessor.generate_chart(
+                                chart_data, 
+                                f"Chart: {generation_query}",
+                                chart_type
+                            )
+                            
+                            document = {
+                                "type": "image",
+                                "data": base64.b64encode(chart_image).decode('utf-8'),
+                                "filename": f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                            }
+                        except Exception as e:
+                            logger.error(f"Error generating chart: {e}")
+                            # Fall back to PDF
+                            pdf_data = DocumentProcessor.generate_pdf(answer, f"Response to: {generation_query}")
+                            document = {
+                                "type": "pdf",
+                                "data": base64.b64encode(pdf_data).decode('utf-8'),
+                                "filename": f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                            }
+                    else:
+                        # Default to PDF
+                        pdf_data = DocumentProcessor.generate_pdf(answer, f"Response to: {generation_query}")
+                        document = {
+                            "type": "pdf",
+                            "data": base64.b64encode(pdf_data).decode('utf-8'),
+                            "filename": f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                        }
+                    
+                    # Upload the document
+                    try:
+                        # Create temp file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{document['filename'].split('.')[-1]}") as temp:
+                            temp.write(base64.b64decode(document["data"]))
+                            temp_path = temp.name
+                        
+                        # Upload to Slack
+                        upload_response = app.client.files_upload(
+                            channels=channel_id,
+                            file=temp_path,
+                            filename=document["filename"],
+                            title=f"Generated document for: {generation_query[:40]}..."
+                        )
+                        
+                        # Delete temp file
+                        os.unlink(temp_path)
+                        
+                        app.client.chat_postMessage(
+                            channel=channel_id,
+                            text=f"Here's the document you requested based on my knowledge."
+                        )
+                    except Exception as e:
+                        logger.error(f"Error uploading document: {e}")
+                        app.client.chat_postMessage(
+                            channel=channel_id,
+                            text="I generated the document but encountered an error when trying to upload it. Please try again."
+                        )
+                except Exception as e:
+                    logger.error(f"Error generating document in DM: {e}")
+                    app.client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"I encountered an error while generating your document: {str(e)}"
+                    )
+            
+            executor.submit(run_generation)
+        
+        else:
+            # Handle general queries using LLM
+            app.client.chat_postMessage(
+                channel=channel_id, 
+                text="I'll answer that based on my knowledge..."
+            )
+            
+            # Use a separate thread for processing
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor()
+            
+            def run_general_query():
+                try:
+                    answer = app.knowledge_bot._generate_llm_answer(text)
+                    app.client.chat_postMessage(channel=channel_id, text=answer)
+                except Exception as e:
+                    logger.error(f"Error processing general query: {e}")
+                    app.client.chat_postMessage(
+                        channel=channel_id,
+                        text="I encountered an error while trying to answer your question. Please try asking in a different way."
+                    )
+            
+            executor.submit(run_general_query)
+
+
+@app.event("member_joined_channel")
+def handle_member_joined(event, say):
+    """Handle when the bot is added to a channel."""
+    # Check if we have initialized the bot
+    if not hasattr(app, "knowledge_bot"):
+        app.knowledge_bot = SlackKnowledgeBot()
+        
+    # Only process if the bot itself joined
+    try:
+        bot_id = app.client.auth_test()["user_id"]
+        if event.get("user") == bot_id:
+            channel_id = event["channel"]
+            
+            logger.info(f"Bot was added to channel {channel_id}. Starting auto-indexing...")
+            say("Thanks for adding me to this channel! I'll start indexing the recent messages so I can help answer questions.")
+            
+            # Use a separate thread to run the indexing operation
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor()
+            
+            def run_initial_indexing():
+                try:
+                    # Default to 30 days for initial indexing
+                    num_messages = app.knowledge_bot.index_channel(channel_id, days_back=30)
+                    logger.info(f"Initial indexing completed: {num_messages} messages")
+                    
+                    if num_messages > 0:
+                        say(f"I've finished indexing {num_messages} messages from the past 30 days. You can now ask me questions about the channel by mentioning me.")
+                    else:
+                        say("I've completed the initial indexing but didn't find any messages to process. You can still ask me questions, but I may not have much information to work with.")
+                except Exception as e:
+                    logger.error(f"Error during initial indexing: {e}")
+                    say("I encountered an issue while trying to index this channel. You can try manually triggering indexing with `@bot index`.")
+            
+            executor.submit(run_initial_indexing)
+    except Exception as e:
+        logger.error(f"Error in member_joined_channel event: {e}")
+
+
+@app.event("file_shared")
+def handle_file_shared(event):
+    """Handle when a file is shared in a channel."""
+    # This event just tells us a file was shared, but we need to get the file info
+    try:
+        # Get file info
+        file_id = event.get("file_id")
+        file_info_response = app.client.files_info(file=file_id)
+        file_info = file_info_response.data.get("file", {})
+        
+        # We don't need to do anything here as files are automatically processed during indexing
+        # But we could add specific handling for immediate file processing if needed
+        
+        logger.info(f"File shared: {file_info.get('name', 'Unknown')} in channel {file_info.get('channels', ['Unknown'])[0]}")
+    except Exception as e:
+        logger.error(f"Error processing file_shared event: {e}")
+
+
+def main():
+    """Main function to start the bot."""
+    # Set up enhanced logging
+    setup_enhanced_logging()
+    
+    # Check required dependencies
+    missing_deps = []
+    try:
+        import pytesseract
+    except ImportError:
+        missing_deps.append("pytesseract (for OCR)")
+    
+    try:
+        import fitz
+    except ImportError:
+        missing_deps.append("PyMuPDF (for PDF processing)")
+    
+    try:
+        import matplotlib
+    except ImportError:
+        missing_deps.append("matplotlib (for chart generation)")
+    
+    try:
+        from reportlab.pdfgen import canvas
+    except ImportError:
+        missing_deps.append("reportlab (for PDF generation)")
+    
+    if missing_deps:
+        logger.warning(f"Missing dependencies: {', '.join(missing_deps)}")
+        logger.warning("Install them with: pip install pytesseract pymupdf matplotlib reportlab")
+        logger.warning("Some features may not work correctly.")
+    
+    # Make sure document cache directory exists
+    DOCUMENT_CACHE_DIR.mkdir(exist_ok=True)
+    
+    # Create bot instance
+    app.knowledge_bot = SlackKnowledgeBot()
+    
+    # Start the Socket Mode handler
+    handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
+    
+    logger.info("Starting Enhanced Slack Knowledge Bot...")
+    handler.start()
+
+if __name__ == "__main__":
+    # Set up proper signal handling for graceful shutdown
+    import signal
+    
+    def signal_handler(sig, frame):
+        logger.info("Shutting down Slack Knowledge Bot...")
+        # Save data before exiting
+        if hasattr(app, "knowledge_bot"):
+            app.knowledge_bot._save_data()
+        exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Start the bot
+    main()
