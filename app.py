@@ -179,6 +179,25 @@ class SlackKnowledgeBot:
             logger.error(f"LLM response error: {e}")
             return "I'm sorry, I couldn't process that request."
 
+    def get_channel_info(self, channel_id):
+        messages = self.channel_messages.get(channel_id, [])
+        if not messages:
+            return "I haven't indexed this channel yet."
+        summary = f"This channel has {len(messages)} messages indexed. Last updated on {datetime.fromtimestamp(self.last_indexed.get(channel_id, 0)).strftime('%Y-%m-%d')}"
+        return summary
+
+    def get_message_by_time(self, channel_id, time_str):
+        try:
+            target_time = datetime.strptime(time_str, "%I:%M %p").time()
+            for msg in self.channel_messages.get(channel_id, []):
+                msg_time = datetime.fromtimestamp(float(msg["ts"])).time()
+                if msg_time.hour == target_time.hour and msg_time.minute == target_time.minute:
+                    return f"{msg['user']}: {msg['text']}"
+            return f"I couldn't find a message at {time_str}."
+        except Exception as e:
+            logger.error(f"Time parse error: {e}")
+            return "I couldn't interpret the time format. Use something like 3:40 PM."
+
 @app.event("app_mention")
 def handle_app_mention(event, say):
     channel_id = event["channel"]
@@ -188,7 +207,15 @@ def handle_app_mention(event, say):
         app.knowledge_bot = SlackKnowledgeBot()
     query = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
     logger.info(f"Received mention from {user}: {query}")
-    response = app.knowledge_bot._generate_llm_answer(query)
+
+    if re.search(r"what can you tell me about this channel", query, re.I):
+        response = app.knowledge_bot.get_channel_info(channel_id)
+    elif re.search(r"what did (\w+) ask at ([0-9: ]+[apAP][mM])", query):
+        time_str = re.findall(r"at ([0-9: ]+[apAP][mM])", query)[0]
+        response = app.knowledge_bot.get_message_by_time(channel_id, time_str)
+    else:
+        response = app.knowledge_bot._generate_llm_answer(query)
+
     say(response)
 
 @app.event("file_shared")
