@@ -75,9 +75,16 @@ class SlackKnowledgeBot:
         if user_id not in self.user_info_cache:
             try:
                 info = app.client.users_info(user=user_id)
-                name = info["user"].get("real_name") or info["user"].get("name")
+                profile = info["user"].get("profile", {})
+                fields = [
+                    info["user"].get("real_name"),
+                    profile.get("display_name"),
+                    info["user"].get("name")
+                ]
+                name = next((n for n in fields if n), user_id)
                 self.user_info_cache[user_id] = name
-                self.name_to_id[name.lower()] = user_id
+                for alias in filter(None, map(str.lower, fields)):
+                    self.name_to_id[alias] = user_id
             except Exception as e:
                 logger.error(f"Error fetching user info for {user_id}: {e}")
                 return user_id
@@ -91,7 +98,7 @@ class SlackKnowledgeBot:
                     if uid:
                         self._get_user_name(uid)
         names = list(self.name_to_id.keys())
-        best = get_close_matches(query_name.lower(), names, n=1, cutoff=0.7)
+        best = get_close_matches(query_name.lower(), names, n=1, cutoff=0.6)
         if best:
             return self.name_to_id[best[0]]
         return None
