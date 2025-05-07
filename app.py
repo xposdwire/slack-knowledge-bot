@@ -59,9 +59,46 @@ class SlackKnowledgeBot:
         except Exception as e:
             logger.error(f"Failed to save message history: {e}")
 
+    def index_channel(self, channel_id, days_back=7):
+        try:
+            oldest_ts = (datetime.now() - timedelta(days=days_back)).timestamp()
+            all_msgs = []
+            cursor = None
+            while True:
+                result = app.client.conversations_history(
+                    channel=channel_id,
+                    limit=100,
+                    cursor=cursor,
+                    oldest=str(oldest_ts)
+                )
+                messages = result.get("messages", [])
+                all_msgs.extend([m for m in messages if "text" in m])
+                cursor = result.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
+            for msg in all_msgs:
+                msg.setdefault("user", "unknown")
+            self.channel_messages[channel_id] = all_msgs
+            self.last_indexed[channel_id] = datetime.now().timestamp()
+            logger.info(f"Indexed {len(all_msgs)} messages from channel {channel_id}")
+            self._save_data()
+        except SlackApiError as e:
+            logger.error(f"Failed to index {channel_id}: {e}")
+
+    def auto_index_all_channels(self):
+        try:
+            result = app.client.conversations_list(types="public_channel,private_channel")
+            for ch in result.get("channels", []):
+                if ch.get("is_member"):
+                    self.index_channel(ch["id"], days_back=7)
+                else:
+                    logger.info(f"Skipping channel {ch['name']} - bot not a member.")
+        except Exception as e:
+            logger.error(f"Auto index error: {e}")
+
     def _generate_llm_answer(self, query):
         try:
-            system_prompt = "You are a helpful assistant in Slack. Answer questions clearly and helpfully."
+            system_prompt = "You are a helpful assistant in Slack. Use your knowledge and sound like a team member."
             response = openai.chat.completions.create(
                 model="gpt-4",
                 messages=[
@@ -98,7 +135,7 @@ class SlackKnowledgeBot:
 
             if closest_msg:
                 ts_str = datetime.fromtimestamp(float(closest_msg['ts'])).strftime('%b %d %I:%M %p')
-                return f"Closest match at {ts_str}: {closest_msg['user']}: {closest_msg['text']}"
+                return f"Closest match at {ts_str}: <@{closest_msg['user']}> said: {closest_msg['text']}"
             return f"No close messages found near '{time_str}'."
         except Exception as e:
             logger.error(f"Natural language time parse error: {e}")
@@ -118,7 +155,10 @@ def handle_app_mention(event, say):
         response = app.knowledge_bot.get_channel_info(channel_id)
     elif re.search(r"what did (\w+) ask (?:at|on|around|about)? (.+)", query):
         time_str = re.findall(r"ask (?:at|on|around|about)? (.+)", query)[0]
-        response = app.knowledge_bot.get_message_by_time(channel_id, time_str)
+        if app.knowledge_bot.channel_messages.get(channel_id):
+            response = app.knowledge_bot.get_message_by_time(channel_id, time_str)
+        else:
+            response = app.knowledge_bot._generate_llm_answer(query)
     else:
         response = app.knowledge_bot._generate_llm_answer(query)
 
@@ -126,5 +166,6 @@ def handle_app_mention(event, say):
 
 if __name__ == "__main__":
     app.knowledge_bot = SlackKnowledgeBot()
+    app.knowledge_bot.auto_index_all_channels()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()
