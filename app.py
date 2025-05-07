@@ -217,8 +217,10 @@ def start_auto_indexing():
     def update_all_channels():
         logger.info("Running periodic auto-index update...")
         try:
-            response = app.client.conversations_list(types="public_channel,private_channel")
             for channel in response["channels"]:
+    if not channel.get("is_member", False):
+        logger.info(f"Skipping channel {channel['name']} - bot not a member.")
+        continue
                 ch_id = channel["id"]
                 now = datetime.now().timestamp()
                 last_ts = app.knowledge_bot.last_indexed.get(ch_id, now - 3600)
