@@ -16,6 +16,7 @@ from slack_sdk.errors import SlackApiError
 import openai
 from dateutil import parser as dt_parser
 from difflib import get_close_matches
+from slack_bolt.context.say import Say
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -102,6 +103,11 @@ class SlackKnowledgeBot:
         if best:
             return self.name_to_id[best[0]]
         return None
+
+    def list_users_in_channel(self, channel_id):
+        user_ids = {msg["user"] for msg in self.channel_messages.get(channel_id, []) if "user" in msg}
+        users = sorted(self._get_user_name(uid) for uid in user_ids if uid)
+        return "Here are the users I've seen in this channel:\n" + "\n".join(f"- {u}" for u in users) if users else "I haven't indexed any users in this channel yet."
 
     def index_channel(self, channel_id, days_back=7):
         try:
@@ -211,6 +217,14 @@ class SlackKnowledgeBot:
             logger.error(f"Keyword search error: {e}")
             return "I had trouble searching the messages for that keyword."
 
+@app.command("/refresh")
+def handle_refresh(ack, body, say: Say):
+    ack()
+    channel_id = body['channel_id']
+    say("Re-indexing messages in this channel... this may take a moment.")
+    app.knowledge_bot.index_channel(channel_id, days_back=7)
+    say("Done! Channel re-indexed.")
+
 @app.event("app_mention")
 def handle_app_mention(event, say):
     channel_id = event["channel"]
@@ -223,12 +237,14 @@ def handle_app_mention(event, say):
 
     if re.search(r"what can you tell me about this channel", query, re.I):
         response = app.knowledge_bot.get_channel_info(channel_id)
-    elif match := re.search(r"what did (\w+) ask (?:at|on|around|about)? (.+)", query):
+    elif match := re.search(r"what did (.+?) ask (?:at|on|around|about)? (.+)", query):
         who, when = match.groups()
         response = app.knowledge_bot.get_message_by_time(channel_id, when.strip(), who.strip())
     elif re.search(r"when did (\w+) mention (.+)", query):
         keyword = re.findall(r"mention (.+)", query)[0].strip()
         response = app.knowledge_bot.find_messages_by_keyword(channel_id, keyword)
+    elif re.search(r"who.*(here|in this channel)", query, re.I):
+        response = app.knowledge_bot.list_users_in_channel(channel_id)
     else:
         response = app.knowledge_bot._generate_llm_answer(query)
 
