@@ -23,6 +23,7 @@ logger = logging.getLogger("SlackBot")
 
 DATA_DIR = Path("channel_data")
 MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
+USER_CACHE_FILE = DATA_DIR / "user_name_cache.pkl"
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -49,6 +50,13 @@ class SlackKnowledgeBot:
             except Exception as e:
                 logger.error(f"Failed to load message history: {e}")
 
+        if USER_CACHE_FILE.exists():
+            try:
+                with open(USER_CACHE_FILE, "rb") as f:
+                    self.name_to_id = pickle.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load name cache: {e}")
+
     def _save_data(self):
         try:
             with open(MESSAGE_HISTORY_FILE, "wb") as f:
@@ -58,8 +66,10 @@ class SlackKnowledgeBot:
                     "user_info_cache": self.user_info_cache,
                     "last_indexed": self.last_indexed
                 }, f)
+            with open(USER_CACHE_FILE, "wb") as f:
+                pickle.dump(self.name_to_id, f)
         except Exception as e:
-            logger.error(f"Failed to save message history: {e}")
+            logger.error(f"Failed to save data: {e}")
 
     def _get_user_name(self, user_id):
         if user_id not in self.user_info_cache:
@@ -169,7 +179,8 @@ class SlackKnowledgeBot:
             if best_msg:
                 name = self._get_user_name(best_msg['user'])
                 ts_str = datetime.fromtimestamp(float(best_msg['ts'])).strftime('%b %d %I:%M %p')
-                return f"Closest match at {ts_str}: {name} said: {best_msg['text']}"
+                link = f"https://slack.com/app_redirect?channel={channel_id}&message_ts={best_msg['ts']}"
+                return f"Closest match at {ts_str}: {name} said: {best_msg['text']}\n<{link}|View in Slack>"
             return f"No recent messages by {query_name} found near '{time_str}'."
         except Exception as e:
             logger.error(f"Time parse error: {e}")
