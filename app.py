@@ -15,6 +15,7 @@ from slack_sdk.errors import SlackApiError
 
 import openai
 from dateutil import parser as dt_parser
+from difflib import get_close_matches
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +33,7 @@ class SlackKnowledgeBot:
         self.document_cache = {}
         self.user_info_cache = {}
         self.last_indexed = {}
+        self.name_to_id = {}
         DATA_DIR.mkdir(exist_ok=True)
         self._load_data()
 
@@ -58,6 +60,31 @@ class SlackKnowledgeBot:
                 }, f)
         except Exception as e:
             logger.error(f"Failed to save message history: {e}")
+
+    def _get_user_name(self, user_id):
+        if user_id not in self.user_info_cache:
+            try:
+                info = app.client.users_info(user=user_id)
+                name = info["user"].get("real_name") or info["user"].get("name")
+                self.user_info_cache[user_id] = name
+                self.name_to_id[name.lower()] = user_id
+            except Exception as e:
+                logger.error(f"Error fetching user info for {user_id}: {e}")
+                return user_id
+        return self.user_info_cache[user_id]
+
+    def _resolve_user_query(self, query_name):
+        if not self.name_to_id:
+            for ch_msgs in self.channel_messages.values():
+                for msg in ch_msgs:
+                    uid = msg.get("user")
+                    if uid:
+                        self._get_user_name(uid)
+        names = list(self.name_to_id.keys())
+        best = get_close_matches(query_name.lower(), names, n=1, cutoff=0.7)
+        if best:
+            return self.name_to_id[best[0]]
+        return None
 
     def index_channel(self, channel_id, days_back=7):
         try:
@@ -120,26 +147,51 @@ class SlackKnowledgeBot:
         summary = f"This channel has {len(messages)} messages indexed. Last updated on {datetime.fromtimestamp(self.last_indexed.get(channel_id, 0)).strftime('%Y-%m-%d')}"
         return summary
 
-    def get_message_by_time(self, channel_id, time_str):
+    def get_message_by_time(self, channel_id, time_str, query_name):
         try:
             target_dt = dt_parser.parse(time_str, fuzzy=True, default=datetime.now())
-            closest_msg = None
             smallest_diff = timedelta(minutes=10)
+            best_msg = None
+
+            query_uid = self._resolve_user_query(query_name)
+            if not query_uid:
+                return f"Sorry, I couldn't match the name '{query_name}' to a Slack user."
 
             for msg in self.channel_messages.get(channel_id, []):
+                if msg.get("user") != query_uid:
+                    continue
                 msg_dt = datetime.fromtimestamp(float(msg["ts"]))
                 time_diff = abs(target_dt - msg_dt)
                 if time_diff < smallest_diff:
-                    closest_msg = msg
+                    best_msg = msg
                     smallest_diff = time_diff
 
-            if closest_msg:
-                ts_str = datetime.fromtimestamp(float(closest_msg['ts'])).strftime('%b %d %I:%M %p')
-                return f"Closest match at {ts_str}: <@{closest_msg['user']}> said: {closest_msg['text']}"
-            return f"No close messages found near '{time_str}'."
+            if best_msg:
+                name = self._get_user_name(best_msg['user'])
+                ts_str = datetime.fromtimestamp(float(best_msg['ts'])).strftime('%b %d %I:%M %p')
+                return f"Closest match at {ts_str}: {name} said: {best_msg['text']}"
+            return f"No recent messages by {query_name} found near '{time_str}'."
         except Exception as e:
-            logger.error(f"Natural language time parse error: {e}")
-            return "I had trouble understanding the time. Try something like 'yesterday at 3 PM' or 'May 5 3:40 PM'."
+            logger.error(f"Time parse error: {e}")
+            return "I had trouble understanding the time. Try something like 'yesterday at 3 PM'."
+
+    def find_messages_by_keyword(self, channel_id, keyword):
+        try:
+            keyword = keyword.lower()
+            matches = [
+                msg for msg in self.channel_messages.get(channel_id, [])
+                if keyword in msg.get("text", "").lower()
+            ]
+            if not matches:
+                return f"No messages found containing '{keyword}'."
+            summary = [
+                f"{datetime.fromtimestamp(float(m['ts'])).strftime('%b %d %I:%M %p')} - <@{m['user']}>: {m['text']}"
+                for m in matches[:10]
+            ]
+            return "Summary of messages mentioning that keyword:\n" + "\n".join(summary)
+        except Exception as e:
+            logger.error(f"Keyword search error: {e}")
+            return "I had trouble searching the messages for that keyword."
 
 @app.event("app_mention")
 def handle_app_mention(event, say):
@@ -153,12 +205,12 @@ def handle_app_mention(event, say):
 
     if re.search(r"what can you tell me about this channel", query, re.I):
         response = app.knowledge_bot.get_channel_info(channel_id)
-    elif re.search(r"what did (\w+) ask (?:at|on|around|about)? (.+)", query):
-        time_str = re.findall(r"ask (?:at|on|around|about)? (.+)", query)[0]
-        if app.knowledge_bot.channel_messages.get(channel_id):
-            response = app.knowledge_bot.get_message_by_time(channel_id, time_str)
-        else:
-            response = app.knowledge_bot._generate_llm_answer(query)
+    elif match := re.search(r"what did (\w+) ask (?:at|on|around|about)? (.+)", query):
+        who, when = match.groups()
+        response = app.knowledge_bot.get_message_by_time(channel_id, when.strip(), who.strip())
+    elif re.search(r"when did (\w+) mention (.+)", query):
+        keyword = re.findall(r"mention (.+)", query)[0].strip()
+        response = app.knowledge_bot.find_messages_by_keyword(channel_id, keyword)
     else:
         response = app.knowledge_bot._generate_llm_answer(query)
 
