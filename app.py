@@ -1,4 +1,4 @@
-﻿# slack_bot_no_ocr.py
+﻿# app.py
 # Full version: Slack bot without OCR/image features
 
 import os
@@ -248,4 +248,3 @@ if __name__ == "__main__":
     app.knowledge_bot = SlackKnowledgeBot()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()
-
