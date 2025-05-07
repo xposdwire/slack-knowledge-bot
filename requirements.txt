@@ -2,7 +2,7 @@ slack-bolt
 slack-sdk
 python-dotenv
 openai
-matplotlib
 reportlab
+matplotlib
 PyMuPDF
 requests

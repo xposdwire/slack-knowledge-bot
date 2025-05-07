@@ -9,7 +9,7 @@ import tempfile
 import json
 import logging
 import pickle
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -24,7 +24,6 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import matplotlib.pyplot as plt
 
-# === Configuration ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SlackBot")
 
@@ -40,7 +39,6 @@ ALLOWED_DOCUMENT_EXTENSIONS = ['.pdf', '.doc', '.docx', '.txt']
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# === DocumentProcessor ===
 class DocumentProcessor:
     @staticmethod
     def process_pdf(pdf_data):
@@ -93,12 +91,12 @@ class DocumentProcessor:
             logger.error(f"Chart generation failed: {e}")
             return None
 
-# === SlackKnowledgeBot ===
 class SlackKnowledgeBot:
     def __init__(self):
         self.channel_messages = {}
         self.document_cache = {}
         self.user_info_cache = {}
+        self.last_indexed = {}
         DATA_DIR.mkdir(exist_ok=True)
         DOCUMENT_CACHE_DIR.mkdir(exist_ok=True)
         self._load_data()
@@ -111,6 +109,7 @@ class SlackKnowledgeBot:
                     self.channel_messages = data.get("channel_messages", {})
                     self.document_cache = data.get("document_cache", {})
                     self.user_info_cache = data.get("user_info_cache", {})
+                    self.last_indexed = data.get("last_indexed", {})
             except Exception as e:
                 logger.error(f"Failed to load message history: {e}")
 
@@ -120,7 +119,8 @@ class SlackKnowledgeBot:
                 pickle.dump({
                     "channel_messages": self.channel_messages,
                     "document_cache": self.document_cache,
-                    "user_info_cache": self.user_info_cache
+                    "user_info_cache": self.user_info_cache,
+                    "last_indexed": self.last_indexed
                 }, f)
         except Exception as e:
             logger.error(f"Failed to save message history: {e}")
@@ -179,58 +179,17 @@ class SlackKnowledgeBot:
             logger.error(f"LLM response error: {e}")
             return "I'm sorry, I couldn't process that request."
 
-# === Event handlers ===
 @app.event("app_mention")
 def handle_app_mention(event, say):
     channel_id = event["channel"]
     text = event["text"]
     user = event.get("user")
-
     if not hasattr(app, "knowledge_bot"):
         app.knowledge_bot = SlackKnowledgeBot()
-
     query = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
     logger.info(f"Received mention from {user}: {query}")
-
-    if query.lower().startswith("index"):
-        say("Indexing this channel. Please wait...")
-        try:
-            messages = app.client.conversations_history(channel=channel_id, limit=100)["messages"]
-            structured = []
-            for msg in messages:
-                if "text" not in msg:
-                    continue
-                structured.append({
-                    "text": msg["text"],
-                    "ts": msg["ts"],
-                    "user": msg.get("user", "unknown")
-                })
-            app.knowledge_bot.channel_messages[channel_id] = structured
-            app.knowledge_bot._save_data()
-            say(f"Indexed {len(structured)} messages ✅")
-        except Exception as e:
-            logger.error(f"Indexing failed: {e}")
-            say("Failed to index channel messages ❌")
-
-    elif query.lower().startswith("generate"):
-        answer = app.knowledge_bot._generate_llm_answer(query)
-        pdf_data = DocumentProcessor.generate_pdf(answer, f"Answer: {query}")
-        filename = f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp:
-            temp.write(pdf_data)
-            temp_path = temp.name
-
-        app.client.files_upload(
-            channels=channel_id,
-            file=temp_path,
-            title=filename,
-            filename=filename
-        )
-        os.unlink(temp_path)
-        say("Here's your generated document! ✅")
-    else:
-        response = app.knowledge_bot._generate_llm_answer(query)
-        say(response)
+    response = app.knowledge_bot._generate_llm_answer(query)
+    say(response)
 
 @app.event("file_shared")
 def handle_file_shared(event):
@@ -243,8 +202,51 @@ def handle_file_shared(event):
     except Exception as e:
         logger.error(f"Error processing shared file: {e}")
 
-# === Main ===
+@app.event("member_joined_channel")
+def handle_member_joined_channel_events(body, logger, say):
+    logger.info(f"Bot noticed a member joined: {body}")
+    user_id = body["event"].get("user")
+    channel_id = body["event"].get("channel")
+    if user_id and channel_id:
+        say(channel=channel_id, text=f"👋 Welcome <@{user_id}>! Let me know if you need help or want me to index this channel.")
+
+# === Background Auto Indexing ===
+def start_auto_indexing():
+    import threading
+
+    def update_all_channels():
+        logger.info("Running periodic auto-index update...")
+        try:
+            response = app.client.conversations_list(types="public_channel,private_channel")
+            for channel in response["channels"]:
+                ch_id = channel["id"]
+                now = datetime.now().timestamp()
+                last_ts = app.knowledge_bot.last_indexed.get(ch_id, now - 3600)
+                logger.info(f"Auto-updating channel {ch_id} since {last_ts}")
+                messages = app.client.conversations_history(
+                    channel=ch_id,
+                    limit=100,
+                    oldest=str(last_ts)
+                )["messages"]
+                existing_ts = {msg["ts"] for msg in app.knowledge_bot.channel_messages.get(ch_id, [])}
+                new_msgs = [
+                    {"text": m["text"], "ts": m["ts"], "user": m.get("user", "unknown")}
+                    for m in messages if m.get("text") and m["ts"] not in existing_ts
+                ]
+                if new_msgs:
+                    app.knowledge_bot.channel_messages.setdefault(ch_id, []).extend(new_msgs)
+                    app.knowledge_bot.last_indexed[ch_id] = now
+                    logger.info(f"Indexed {len(new_msgs)} new messages for {ch_id}")
+            app.knowledge_bot._save_data()
+        except Exception as e:
+            logger.error(f"Auto indexing failed: {e}")
+        finally:
+            threading.Timer(900, update_all_channels).start()
+
+    update_all_channels()
+
 if __name__ == "__main__":
     app.knowledge_bot = SlackKnowledgeBot()
+    start_auto_indexing()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()
