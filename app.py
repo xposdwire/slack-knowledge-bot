@@ -140,23 +140,26 @@ def extract_datetime(text):
 @app.event("app_mention")
 def handle_app_mention(body, say):
     event = body.get("event", {})
-    text = event.get("text", "").lower()
+    text = event.get("text", "")
+    lower_text = text.lower()
     channel_id = event.get("channel")
     channel_name = get_channel_name(channel_id)
 
     logger.info(f"Received mention: {text}")
 
-    if "index this channel" in text or "index channel" in text:
+    if "index this channel" in lower_text or "index channel" in lower_text:
         target_channel_id = extract_channel_id(text) or channel_id
         say(index_channel(target_channel_id))
+        return
 
-    elif any(kw in text for kw in ["summarize", "recap", "what was discussed", "what happened"]):
-        days_back = extract_requested_timeframe(text)
+    if any(kw in lower_text for kw in ["summarize", "recap", "what was discussed", "what happened"]):
+        days_back = extract_requested_timeframe(lower_text)
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
+        return
 
-    elif re.search(r"what did (.+?) (say|ask|mention|share|do).*?(\d{1,2}[:\.]\d{2}( ?(am|pm))?( on [^\n\r]+)?)", text):
-        match = re.search(r"what did (.+?) (say|ask|mention|share|do).*?(\d{1,2}[:\.]\d{2}( ?(am|pm))?( on [^\n\r]+)?)", text)
+    match = re.search(r"what did (.+?) (say|ask|mention|share|do).*?(\d{1,2}[:\.]\d{2}( ?(am|pm))?( on [^\n\r]+)?)", lower_text)
+    if match:
         user_name = match.group(1).strip()
         time_text = match.group(3).strip()
         user_id = resolve_user_name(user_name)
@@ -175,8 +178,9 @@ def handle_app_mention(body, say):
             say(f"<@{closest['user']}> said at {timestamp}: {closest['text']}")
         else:
             say("No close messages found near that time.")
+        return
 
-    elif "who is in this channel" in text or "user list" in text:
+    if "who is in this channel" in lower_text or "user list" in lower_text:
         try:
             members = client.conversations_members(channel=channel_id)["members"]
             user_names = [get_user_name(uid) for uid in members]
@@ -184,9 +188,9 @@ def handle_app_mention(body, say):
         except Exception as e:
             logger.error(f"Error fetching users: {e}")
             say("Couldn't retrieve the user list.")
+        return
 
-    else:
-        say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40?`.")
+    say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40?`.")
 
 def main():
     logger.info("⚡️ Slack Bot is starting...")
@@ -195,3 +199,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
