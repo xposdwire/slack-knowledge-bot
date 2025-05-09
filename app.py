@@ -23,6 +23,7 @@ openai_client = openai
 user_cache = {}
 message_cache = {}
 
+
 def get_channel_name(channel_id):
     try:
         result = client.conversations_info(channel=channel_id)
@@ -31,10 +32,11 @@ def get_channel_name(channel_id):
         logger.error(f"Slack API error while getting channel name: {e.response['error']}")
         return channel_id
 
+
 def fetch_recent_messages(channel_id, count=100, days_back=None):
     try:
         latest = datetime.now()
-        oldest = latest - timedelta(days=days_back or 1)
+        oldest = latest - timedelta(days=days_back or 7)
         oldest_ts = oldest.timestamp()
 
         response = client.conversations_history(
@@ -48,6 +50,7 @@ def fetch_recent_messages(channel_id, count=100, days_back=None):
     except SlackApiError as e:
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
+
 
 def fetch_messages_around_time(channel_id, target_time, minutes=10):
     try:
@@ -67,6 +70,7 @@ def fetch_messages_around_time(channel_id, target_time, minutes=10):
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
 
+
 def summarize_messages(messages):
     cleaned = [f"User <@{m.get('user', 'unknown')}> said: {m.get('text', '')}" for m in messages if 'text' in m]
     if not cleaned:
@@ -79,17 +83,18 @@ def summarize_messages(messages):
     )
 
     try:
-        response = openai_client.chat.completions.create(
+        response = openai_client.ChatCompletion.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant summarizing Slack conversations."},
                 {"role": "user", "content": full_prompt},
             ]
         )
-        return response.choices[0].message.content.strip()
+        return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
         logger.error(f"OpenAI summarization error: {e}")
         return "Failed to generate summary."
+
 
 def index_channel(channel_id):
     channel_name = get_channel_name(channel_id)
@@ -98,6 +103,7 @@ def index_channel(channel_id):
     logger.info(f"Indexed {len(messages)} messages in channel {channel_name} ({channel_id})")
     return f"Started indexing channel #{channel_name}."
 
+
 def extract_requested_timeframe(text):
     if "yesterday" in text:
         return 1
@@ -105,9 +111,11 @@ def extract_requested_timeframe(text):
         return 0
     return None
 
+
 def extract_channel_id(text):
     match = re.search(r"<#(\w+)(?:\|[^>]+)?>", text)
     return match.group(1) if match else None
+
 
 def get_user_name(user_id):
     if user_id in user_cache:
@@ -121,21 +129,22 @@ def get_user_name(user_id):
         logger.error(f"Error fetching user name for {user_id}: {e.response['error']}")
         return user_id
 
+
 def resolve_user_name(name):
     try:
         users = client.users_list().get("members", [])
-        lower_name = name.lower().strip("@")
+        name = name.lower().strip("<@>")
         for user in users:
-            if (
-                user.get("name", "").lower() == lower_name or
-                user.get("real_name", "").lower() == lower_name or
-                user.get("profile", {}).get("display_name", "").lower() == lower_name or
-                user.get("id", "") == name
-            ):
-                return user.get("id")
+            uid = user.get("id", "")
+            uname = user.get("name", "").lower()
+            display = user.get("profile", {}).get("display_name", "").lower()
+            real = user.get("real_name", "").lower()
+            if name in {uname, display, real, uid.lower()}:
+                return uid
     except SlackApiError as e:
         logger.error(f"Failed to resolve user name '{name}': {e.response['error']}")
     return None
+
 
 def extract_datetime(text):
     try:
@@ -143,6 +152,7 @@ def extract_datetime(text):
     except Exception as e:
         logger.warning(f"Failed to extract date from '{text}': {e}")
         return None
+
 
 @app.event("app_mention")
 def handle_app_mention(body, say):
@@ -185,7 +195,8 @@ def handle_app_mention(body, say):
         if hits:
             closest = sorted(hits, key=lambda m: abs(float(m["ts"]) - target_time.timestamp()))[0]
             timestamp = datetime.fromtimestamp(float(closest['ts'])).strftime('%I:%M %p')
-            say(f"<@{closest['user']}> said at {timestamp}: {closest['text']}")
+            text_out = closest['text'].strip()
+            say(f"<@{closest['user']}> said at {timestamp}: {text_out}")
         else:
             say("No close messages found near that time.")
         return
@@ -202,10 +213,12 @@ def handle_app_mention(body, say):
 
     say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40`.")
 
+
 def main():
     logger.info("⚡️ Slack Bot is starting...")
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
+
 
 if __name__ == "__main__":
     main()
