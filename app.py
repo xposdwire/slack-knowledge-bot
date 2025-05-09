@@ -50,6 +50,24 @@ def fetch_recent_messages(channel_id, count=100, days_back=None):
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
 
+def fetch_messages_around_time(channel_id, target_time, minutes=10):
+    try:
+        delta = timedelta(minutes=minutes)
+        oldest_ts = (target_time - delta).timestamp()
+        latest_ts = (target_time + delta).timestamp()
+
+        response = client.conversations_history(
+            channel=channel_id,
+            oldest=oldest_ts,
+            latest=latest_ts,
+            inclusive=True,
+            limit=100
+        )
+        return response.get("messages", [])
+    except SlackApiError as e:
+        logger.error(f"Error fetching messages: {e.response['error']}")
+        return []
+
 def summarize_messages(messages):
     cleaned = [f"User <@{m.get('user', 'unknown')}> said: {m.get('text', '')}" for m in messages if 'text' in m]
     if not cleaned:
@@ -102,12 +120,23 @@ def get_user_name(user_id):
         logger.error(f"Error fetching user name for {user_id}: {e.response['error']}")
         return user_id
 
+def resolve_user_name(name):
+    try:
+        users = client.users_list().get("members", [])
+        for user in users:
+            if user.get("name", "").lower() == name.lower():
+                return user.get("id")
+    except SlackApiError as e:
+        logger.error(f"Failed to resolve user name '{name}': {e.response['error']}")
+    return None
+
 # --- NLP-based Command Handler ---
 @app.event("app_mention")
 def handle_app_mention(body, say):
     event = body.get("event", {})
     text = event.get("text", "").lower()
     channel_id = event.get("channel")
+    channel_name = get_channel_name(channel_id)
 
     logger.info(f"Received mention: {text}")
 
@@ -120,6 +149,29 @@ def handle_app_mention(body, say):
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
+    elif re.search(r"what did (\w+) say.*?(\d{1,2}:\d{2})", text):
+        match = re.search(r"what did (\w+) say.*?(\d{1,2}:\d{2})", text)
+        user_name = match.group(1)
+        time_str = match.group(2)
+        user_id = resolve_user_name(user_name)
+
+        if not user_id:
+            say(f"Sorry, I couldn't match the name '{user_name}' to a Slack user.")
+            return
+
+        try:
+            now = datetime.now()
+            target_time = now.replace(hour=int(time_str.split(":" )[0]), minute=int(time_str.split(":" )[1]), second=0)
+            messages = fetch_messages_around_time(channel_id, target_time)
+            hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
+            if hits:
+                say("\n".join(f"<@{m['user']}> said at {datetime.fromtimestamp(float(m['ts'])).strftime('%I:%M %p')}: {m['text']}" for m in hits))
+            else:
+                say("No close messages found near that time.")
+        except Exception as e:
+            logger.error(f"Error processing time-based message search: {e}")
+            say("I couldn't retrieve messages for that time.")
+
     elif "who is in this channel" in text or "user list" in text:
         try:
             members = client.conversations_members(channel=channel_id)["members"]
@@ -129,11 +181,8 @@ def handle_app_mention(body, say):
             logger.error(f"Error fetching users: {e}")
             say("Couldn't retrieve the user list.")
 
-    elif any(kw in text for kw in ["who joined", "who left", "who posted"]):
-        say("That query type is coming soon. Thanks for your patience!")
-
     else:
-        say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, or `who is in this channel?`.")
+        say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40?`.")
 
 # --- Entry Point ---
 def main():
