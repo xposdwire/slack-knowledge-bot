@@ -87,6 +87,12 @@ def extract_channel_id(text):
     match = re.search(r"<#(\w+)(?:\|[^>]+)?>", text)
     return match.group(1) if match else None
 
+def is_requesting_summary(text):
+    return any(kw in text for kw in ["summarize", "recap", "what was discussed", "what happened"])
+
+def is_requesting_user_list(text):
+    return "who is in this channel" in text or "user list" in text
+
 # --- NLP-based Command Handler ---
 @app.event("app_mention")
 def handle_app_mention(body, say):
@@ -100,22 +106,22 @@ def handle_app_mention(body, say):
         target_channel_id = extract_channel_id(text) or channel_id
         say(index_channel(target_channel_id))
 
-    elif any(kw in text for kw in ["summarize", "recap", "what was discussed", "what happened"]):
+    elif is_requesting_summary(text):
         days_back = extract_requested_timeframe(text)
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
-    elif "who is in this channel" in text or "user list" in text:
+    elif is_requesting_user_list(text):
         try:
             members = client.conversations_members(channel=channel_id)["members"]
             user_names = [client.users_info(user=uid)["user"]["name"] for uid in members]
-OAOAOA            say("Users in this channel: " + ", ".join(user_names))
+            say("Users in this channel: " + ", ".join(user_names))
         except Exception as e:
             logger.error(f"Error fetching users: {e}")
-OAOAOAOAOAOAOAOAOAOAOAOA            say("Couldn't retrieve the user list.")
-OAOAOAOAOAOA
+            say("Couldn't retrieve the user list.")
+
     else:
-OAOAOAOAOAOA        say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, or `who is in this channel?`.")
+        say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, or `who is in this channel?`.")
 
 # --- Entry Point ---
 def main():
