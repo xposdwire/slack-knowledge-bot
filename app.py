@@ -7,7 +7,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 from slack_sdk import WebClient
 from dotenv import load_dotenv
-from openai import OpenAI
+import openai
 from dateutil import parser as date_parser
 
 load_dotenv()
@@ -17,7 +17,8 @@ logger = logging.getLogger("SlackBot")
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai.api_key = os.getenv("OPENAI_API_KEY")
+openai_client = openai
 
 user_cache = {}
 
@@ -75,7 +76,7 @@ def summarize_messages(messages):
     )
 
     try:
-        response = openai_client.chat.completions.create(
+        response = openai_client.ChatCompletion.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant summarizing Slack conversations."},
@@ -158,17 +159,17 @@ def handle_app_mention(body, say):
         say(summarize_messages(messages))
         return
 
-    match = re.search(r"what did (.+?) (say|ask|mention|share|do).*?(\d{1,2}[:\.]\d{2}( ?(am|pm))?( on [^\n\r]+)?)", lower_text)
+    match = re.search(r"what(?:\s+did|\s+was)?\s+(?P<name>[^\s]+).*?(?:say|ask|mention|share|do)?(?:.*?(at|around|on)?\s+(?P<datetime>.+))", lower_text)
     if match:
-        user_name = match.group(1).strip()
-        time_text = match.group(3).strip()
+        user_name = match.group("name").strip()
+        time_text = match.group("datetime")
         user_id = resolve_user_name(user_name)
 
         if not user_id:
             say(f"Sorry, I couldn't match the name '{user_name}' to a Slack user.")
             return
 
-        target_time = extract_datetime(time_text) or datetime.now()
+        target_time = extract_datetime(time_text or "") or datetime.now()
         messages = fetch_messages_around_time(channel_id, target_time)
 
         hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
@@ -199,4 +200,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
