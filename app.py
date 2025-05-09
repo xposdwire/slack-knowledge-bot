@@ -181,7 +181,6 @@ class SlackKnowledgeBot:
             return "I couldn't summarize that discussion."
 
 def extract_channel_id(query_text):
-    # Match <#C12345678|channel-name>, #channel-name, or plain name
     patterns = [
         r"<#(C[0-9A-Z]+)\|[\w\-]+>",
         r"#([\w\-]+)",
@@ -209,18 +208,17 @@ def handle_app_mention(event, say):
         _, _, keyword, date_hint = match.groups()
         day = datetime.today().date() - timedelta(days=1) if date_hint and "yesterday" in date_hint else datetime.today().date()
         response = app.knowledge_bot.summarize_discussion(channel_id, keyword, day)
-    elif re.search(r"(index|fetch|load|grab|get history).*channel", query, re.I):
+    elif re.search(r"(index|fetch|load|grab|get history|track|monitor|watch|scan).*channel", query, re.I):
         input_id = extract_channel_id(query)
-        if input_id:
-            result = app.client.conversations_list(types="public_channel,private_channel")
-            match_id = next((c['id'] for c in result['channels'] if c['name'] == input_id or c['id'] == input_id), None)
-            if match_id:
-                app.knowledge_bot.index_channel(match_id)
-                response = f"Indexed channel <#{match_id}>!"
-            else:
-                response = f"Couldn't find a channel named or with ID '{input_id}'."
+        if "this channel" in query.lower() or not input_id:
+            input_id = channel_id
+        result = app.client.conversations_list(types="public_channel,private_channel")
+        match_id = next((c['id'] for c in result['channels'] if c['id'] == input_id or c['name'] == input_id), None)
+        if match_id:
+            app.knowledge_bot.index_channel(match_id)
+            response = f"Indexed channel <#{match_id}>!"
         else:
-            response = "No recognizable channel ID or name provided."
+            response = f"Couldn't find a channel named or with ID '{input_id}'."
     elif re.search(r"who.*(here|in this channel)", query, re.I):
         response = app.knowledge_bot.list_users_in_channel(channel_id)
     else:
@@ -233,4 +231,3 @@ if __name__ == "__main__":
     app.knowledge_bot.auto_index_all_channels()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()
-
