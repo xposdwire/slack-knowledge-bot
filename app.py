@@ -154,6 +154,9 @@ def handle_app_mention(body, say):
 
     logger.info(f"Received mention: {text}")
 
+    if channel_id not in message_cache:
+        fetch_recent_messages(channel_id, days_back=7)
+
     if "index this channel" in lower_text or "index channel" in lower_text:
         target_channel_id = extract_channel_id(text) or channel_id
         say(index_channel(target_channel_id))
@@ -165,14 +168,14 @@ def handle_app_mention(body, say):
         say(summarize_messages(messages))
         return
 
-    match = re.search(r"(?:what|did)?\s*(?P<name>[\w@]+).*?(?:say|ask|mention|share|do)?(?:.*?(?:at|around|on)?\s+(?P<datetime>.+))", lower_text)
+    match = re.search(r"(?:what|did)?\s*(?P<name>[\w@<>]+).*?(?:say|ask|mention|share|do)?(?:.*?(?:at|around|on)?\s+(?P<datetime>.+))", lower_text)
     if match:
-        user_name = match.group("name").strip()
+        raw_name = match.group("name").strip("<@>")
         time_text = match.group("datetime")
-        user_id = resolve_user_name(user_name)
+        user_id = resolve_user_name(raw_name)
 
         if not user_id:
-            say(f"Sorry, I couldn't match the name '{user_name}' to a Slack user.")
+            say(f"Sorry, I couldn't match the name '{raw_name}' to a Slack user.")
             return
 
         target_time = extract_datetime(time_text or "") or datetime.now()
