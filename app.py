@@ -27,7 +27,7 @@ MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
 USER_CACHE_FILE = DATA_DIR / "user_name_cache.pkl"
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
 
 class SlackKnowledgeBot:
     def __init__(self):
@@ -36,7 +36,6 @@ class SlackKnowledgeBot:
         self.user_info_cache = {}
         self.last_indexed = {}
         self.name_to_id = {}
-        self.channel_name_map = {}
         DATA_DIR.mkdir(exist_ok=True)
         self._load_data()
 
@@ -105,15 +104,6 @@ class SlackKnowledgeBot:
             return self.name_to_id[best[0]]
         return None
 
-    def _resolve_channel_name(self, name):
-        try:
-            result = app.client.conversations_list(types="public_channel,private_channel")
-            self.channel_name_map = {ch["name"]: ch["id"] for ch in result["channels"]}
-            return self.channel_name_map.get(name.strip("#"))
-        except Exception as e:
-            logger.error(f"Channel resolve failed: {e}")
-            return None
-
     def list_users_in_channel(self, channel_id):
         user_ids = {msg["user"] for msg in self.channel_messages.get(channel_id, []) if "user" in msg}
         users = sorted(self._get_user_name(uid) for uid in user_ids if uid)
@@ -156,23 +146,6 @@ class SlackKnowledgeBot:
         except Exception as e:
             logger.error(f"Auto index error: {e}")
 
-    def find_messages_by_keyword_and_time(self, channel_id, keyword, time_window):
-        try:
-            keyword = keyword.lower()
-            start = dt_parser.parse(time_window, fuzzy=True, default=datetime.now())
-            end = start + timedelta(days=1)
-            matches = [
-                m for m in self.channel_messages.get(channel_id, [])
-                if keyword in m.get("text", "").lower()
-                and start.timestamp() <= float(m["ts"]) <= end.timestamp()
-            ]
-            if not matches:
-                return f"No messages found about '{keyword}' on {start.strftime('%Y-%m-%d')}."
-            return "\n".join(f"- {datetime.fromtimestamp(float(m['ts'])).strftime('%b %d %I:%M %p')}: <@{m['user']}> {m['text']}" for m in matches[:5])
-        except Exception as e:
-            logger.error(f"Keyword+time search error: {e}")
-            return "Failed to search with time window."
-
     def _generate_llm_answer(self, query):
         try:
             system_prompt = "You are a helpful assistant in Slack. Use your knowledge and sound like a team member."
@@ -189,6 +162,23 @@ class SlackKnowledgeBot:
         except Exception as e:
             logger.error(f"LLM response error: {e}")
             return "I'm sorry, I couldn't process that request."
+
+    def summarize_discussion(self, channel_id, keyword=None, day=None):
+        try:
+            msgs = self.channel_messages.get(channel_id, [])
+            if day:
+                day_start = datetime.combine(day, datetime.min.time())
+                day_end = datetime.combine(day, datetime.max.time())
+                msgs = [m for m in msgs if day_start.timestamp() <= float(m["ts"]) <= day_end.timestamp()]
+            if keyword:
+                msgs = [m for m in msgs if keyword.lower() in m.get("text", "").lower()]
+            if not msgs:
+                return f"No messages found{' matching your query' if keyword else ''}."
+            joined = "\n".join(f"<@{m['user']}>: {m['text']}" for m in msgs[-20:])
+            return self._generate_llm_answer(f"Summarize this conversation:\n{joined}")
+        except Exception as e:
+            logger.error(f"Summarize error: {e}")
+            return "I couldn't summarize that discussion."
 
 @app.command("/refresh")
 def handle_refresh(ack, body, say: Say):
@@ -208,20 +198,32 @@ def handle_app_mention(event, say):
     query = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
     logger.info(f"Received mention from {user}: {query}")
 
-    if m := re.search(r"index channel #?(\S+)", query, re.I):
-        ch_name = m.group(1)
-        ch_id = app.knowledge_bot._resolve_channel_name(ch_name)
-        if ch_id:
-            app.knowledge_bot.index_channel(ch_id)
-            say(f"Channel #{ch_name} has been indexed.")
+    if re.search(r"summarize.*this channel", query, re.I):
+        response = app.knowledge_bot.summarize_discussion(channel_id)
+    elif match := re.search(r"summarize.*(?:about|on)?\s*(\w+)?(?:\s+(today|yesterday))?", query, re.I):
+        keyword, day_str = match.groups()
+        day = datetime.today().date() - timedelta(days=1) if day_str == "yesterday" else datetime.today().date()
+        response = app.knowledge_bot.summarize_discussion(channel_id, keyword, day)
+    elif match := re.search(r"index channel.*#?(\S+)", query):
+        input_id = match.group(1).lstrip("#")
+        result = app.client.conversations_list(types="public_channel,private_channel")
+        match_id = next((c['id'] for c in result['channels'] if c['name'] == input_id or c['id'] == input_id), None)
+        if match_id:
+            app.knowledge_bot.index_channel(match_id)
+            response = f"Indexed channel <#{match_id}>!"
         else:
-            say("Couldn't find that channel.")
-    elif m := re.search(r"what was discussed about (.+?) (yesterday|today|last week|on .+?)", query, re.I):
-        keyword, time_phrase = m.groups()
-        response = app.knowledge_bot.find_messages_by_keyword_and_time(channel_id, keyword.strip(), time_phrase)
-        say(response)
+            response = f"Couldn't find a channel named or with ID '{input_id}'."
+    elif re.search(r"what can you tell me about this channel", query, re.I):
+        response = app.knowledge_bot.get_channel_info(channel_id)
+    elif match := re.search(r"what did (.+?) ask (?:at|on|around|about)? (.+)", query):
+        who, when = match.groups()
+        response = app.knowledge_bot.get_message_by_time(channel_id, when.strip(), who.strip())
+    elif re.search(r"who.*(here|in this channel)", query, re.I):
+        response = app.knowledge_bot.list_users_in_channel(channel_id)
     else:
-        say(app.knowledge_bot._generate_llm_answer(query))
+        response = app.knowledge_bot._generate_llm_answer(query)
+
+    say(response)
 
 if __name__ == "__main__":
     app.knowledge_bot = SlackKnowledgeBot()
