@@ -21,6 +21,7 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 openai_client = openai
 
 user_cache = {}
+message_cache = {}
 
 def get_channel_name(channel_id):
     try:
@@ -41,7 +42,9 @@ def fetch_recent_messages(channel_id, count=100, days_back=None):
             limit=count,
             oldest=oldest_ts
         )
-        return [m for m in response.get("messages", []) if m.get("subtype") != "bot_message"]
+        messages = [m for m in response.get("messages", []) if m.get("subtype") != "bot_message"]
+        message_cache[channel_id] = messages
+        return messages
     except SlackApiError as e:
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
@@ -90,7 +93,9 @@ def summarize_messages(messages):
 
 def index_channel(channel_id):
     channel_name = get_channel_name(channel_id)
-    logger.info(f"Started indexing channel {channel_name} ({channel_id})")
+    messages = fetch_recent_messages(channel_id, days_back=7)
+    message_cache[channel_id] = messages
+    logger.info(f"Indexed {len(messages)} messages in channel {channel_name} ({channel_id})")
     return f"Started indexing channel #{channel_name}."
 
 def extract_requested_timeframe(text):
@@ -156,11 +161,11 @@ def handle_app_mention(body, say):
 
     if any(kw in lower_text for kw in ["summarize", "recap", "what was discussed", "what happened"]):
         days_back = extract_requested_timeframe(lower_text)
-        messages = fetch_recent_messages(channel_id, days_back=days_back)
+        messages = message_cache.get(channel_id) or fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
         return
 
-    match = re.search(r"(?:what|did)\\s+(?P<name>\w+).*?(?:say|ask|mention|share|do)?(?:.*?(?:at|around|on)?\\s+(?P<datetime>.+))", lower_text)
+    match = re.search(r"(?:what|did)?\s*(?P<name>[\w@]+).*?(?:say|ask|mention|share|do)?(?:.*?(?:at|around|on)?\s+(?P<datetime>.+))", lower_text)
     if match:
         user_name = match.group("name").strip()
         time_text = match.group("datetime")
@@ -171,7 +176,7 @@ def handle_app_mention(body, say):
             return
 
         target_time = extract_datetime(time_text or "") or datetime.now()
-        messages = fetch_messages_around_time(channel_id, target_time)
+        messages = message_cache.get(channel_id) or fetch_recent_messages(channel_id)
 
         hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
         if hits:
@@ -192,7 +197,7 @@ def handle_app_mention(body, say):
             say("Couldn't retrieve the user list.")
         return
 
-    say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40?`.")
+    say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40`.")
 
 def main():
     logger.info("⚡️ Slack Bot is starting...")
