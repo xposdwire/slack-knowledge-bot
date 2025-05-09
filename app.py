@@ -76,7 +76,7 @@ def summarize_messages(messages):
     )
 
     try:
-        response = openai_client.ChatCompletion.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant summarizing Slack conversations."},
@@ -135,7 +135,8 @@ def resolve_user_name(name):
 def extract_datetime(text):
     try:
         return date_parser.parse(text, fuzzy=True)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to extract date from '{text}': {e}")
         return None
 
 @app.event("app_mention")
@@ -159,7 +160,7 @@ def handle_app_mention(body, say):
         say(summarize_messages(messages))
         return
 
-    match = re.search(r"what(?:\s+did|\s+was)?\s+(?P<name>[^\s]+).*?(?:say|ask|mention|share|do)?(?:.*?(at|around|on)?\s+(?P<datetime>.+))", lower_text)
+    match = re.search(r"(?:what|did)\\s+(?P<name>\w+).*?(?:say|ask|mention|share|do)?(?:.*?(?:at|around|on)?\\s+(?P<datetime>.+))", lower_text)
     if match:
         user_name = match.group("name").strip()
         time_text = match.group("datetime")
@@ -200,3 +201,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
