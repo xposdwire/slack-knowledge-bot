@@ -200,12 +200,12 @@ def handle_app_mention(event, say):
 
     if re.search(r"summarize.*this channel", query, re.I):
         response = app.knowledge_bot.summarize_discussion(channel_id)
-    elif match := re.search(r"summarize.*(?:about|on)?\s*(\w+)?(?:\s+(today|yesterday))?", query, re.I):
-        keyword, day_str = match.groups()
-        day = datetime.today().date() - timedelta(days=1) if day_str == "yesterday" else datetime.today().date()
+    elif match := re.search(r"(?:summarize|what was discussed).*?(about|on)?\s*(\w+)?(?:\s+(today|yesterday|\d{1,2} \w+|\w+ \d{1,2}))?", query, re.I):
+        _, keyword, date_hint = match.groups()
+        day = datetime.today().date() - timedelta(days=1) if date_hint and "yesterday" in date_hint else datetime.today().date()
         response = app.knowledge_bot.summarize_discussion(channel_id, keyword, day)
-    elif match := re.search(r"index channel.*#?(\S+)", query):
-        input_id = match.group(1).lstrip("#")
+    elif match := re.search(r"(?:index|fetch|load|grab|get history).*channel.*[#<]?([A-Z0-9_\-]+)", query, re.I):
+        input_id = match.group(1).strip()
         result = app.client.conversations_list(types="public_channel,private_channel")
         match_id = next((c['id'] for c in result['channels'] if c['name'] == input_id or c['id'] == input_id), None)
         if match_id:
@@ -220,9 +220,6 @@ def handle_app_mention(event, say):
         response = app.knowledge_bot.get_message_by_time(channel_id, when.strip(), who.strip())
     elif re.search(r"who.*(here|in this channel)", query, re.I):
         response = app.knowledge_bot.list_users_in_channel(channel_id)
-    elif match := re.search(r"what was discussed(?: in)?(?: the)? channel (#[^\s]+|\S+)?(?: (?:today|yesterday|\d{1,2} \w+|\w+ \d{1,2}))?", query, re.I):
-        ch, date_hint = match.groups()
-        response = app.knowledge_bot.summarize_discussion(channel_id)
     else:
         response = app.knowledge_bot._generate_llm_answer(query)
 
