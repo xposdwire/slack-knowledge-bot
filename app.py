@@ -8,7 +8,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 from slack_sdk import WebClient
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -20,7 +20,10 @@ logger = logging.getLogger("SlackBot")
 # Initialize Slack and OpenAI
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
-openai.api_key = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# In-memory cache for user names
+user_cache = {}
 
 # --- Helper Functions ---
 def get_channel_name(channel_id):
@@ -59,7 +62,7 @@ def summarize_messages(messages):
     )
 
     try:
-        response = openai.ChatCompletion.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant summarizing Slack conversations."},
@@ -87,11 +90,17 @@ def extract_channel_id(text):
     match = re.search(r"<#(\w+)(?:\|[^>]+)?>", text)
     return match.group(1) if match else None
 
-def is_requesting_summary(text):
-    return any(kw in text for kw in ["summarize", "recap", "what was discussed", "what happened"])
-
-def is_requesting_user_list(text):
-    return "who is in this channel" in text or "user list" in text
+def get_user_name(user_id):
+    if user_id in user_cache:
+        return user_cache[user_id]
+    try:
+        info = client.users_info(user=user_id)
+        name = info["user"]["name"]
+        user_cache[user_id] = name
+        return name
+    except SlackApiError as e:
+        logger.error(f"Error fetching user name for {user_id}: {e.response['error']}")
+        return user_id
 
 # --- NLP-based Command Handler ---
 @app.event("app_mention")
@@ -106,19 +115,22 @@ def handle_app_mention(body, say):
         target_channel_id = extract_channel_id(text) or channel_id
         say(index_channel(target_channel_id))
 
-    elif is_requesting_summary(text):
+    elif any(kw in text for kw in ["summarize", "recap", "what was discussed", "what happened"]):
         days_back = extract_requested_timeframe(text)
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
-    elif is_requesting_user_list(text):
+    elif "who is in this channel" in text or "user list" in text:
         try:
             members = client.conversations_members(channel=channel_id)["members"]
-            user_names = [client.users_info(user=uid)["user"]["name"] for uid in members]
+            user_names = [get_user_name(uid) for uid in members]
             say("Users in this channel: " + ", ".join(user_names))
         except Exception as e:
             logger.error(f"Error fetching users: {e}")
             say("Couldn't retrieve the user list.")
+
+    elif any(kw in text for kw in ["who joined", "who left", "who posted"]):
+        say("That query type is coming soon. Thanks for your patience!")
 
     else:
         say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, or `who is in this channel?`.")
