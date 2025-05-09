@@ -27,7 +27,7 @@ MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
 USER_CACHE_FILE = DATA_DIR / "user_name_cache.pkl"
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-openai_client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class SlackKnowledgeBot:
     def __init__(self):
@@ -220,6 +220,9 @@ def handle_app_mention(event, say):
         response = app.knowledge_bot.get_message_by_time(channel_id, when.strip(), who.strip())
     elif re.search(r"who.*(here|in this channel)", query, re.I):
         response = app.knowledge_bot.list_users_in_channel(channel_id)
+    elif match := re.search(r"what was discussed(?: in)?(?: the)? channel (#[^\s]+|\S+)?(?: (?:today|yesterday|\d{1,2} \w+|\w+ \d{1,2}))?", query, re.I):
+        ch, date_hint = match.groups()
+        response = app.knowledge_bot.summarize_discussion(channel_id)
     else:
         response = app.knowledge_bot._generate_llm_answer(query)
 
@@ -230,4 +233,3 @@ if __name__ == "__main__":
     app.knowledge_bot.auto_index_all_channels()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()
-
