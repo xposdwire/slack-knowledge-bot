@@ -22,6 +22,7 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 user_cache = {}
 message_cache = {}
 
+
 def get_channel_name(channel_id):
     try:
         result = client.conversations_info(channel=channel_id)
@@ -29,6 +30,7 @@ def get_channel_name(channel_id):
     except SlackApiError as e:
         logger.error(f"Slack API error while getting channel name: {e.response['error']}")
         return channel_id
+
 
 def fetch_recent_messages(channel_id, count=100, days_back=None):
     try:
@@ -48,6 +50,7 @@ def fetch_recent_messages(channel_id, count=100, days_back=None):
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
 
+
 def fetch_messages_around_time(channel_id, target_time, minutes=10):
     try:
         delta = timedelta(minutes=minutes)
@@ -65,6 +68,7 @@ def fetch_messages_around_time(channel_id, target_time, minutes=10):
     except SlackApiError as e:
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
+
 
 def summarize_messages(messages):
     cleaned = [f"User <@{m.get('user', 'unknown')}> said: {m.get('text', '')}" for m in messages if 'text' in m]
@@ -90,12 +94,14 @@ def summarize_messages(messages):
         logger.error(f"OpenAI summarization error: {e}")
         return "Failed to generate summary."
 
+
 def index_channel(channel_id):
     channel_name = get_channel_name(channel_id)
     messages = fetch_recent_messages(channel_id, days_back=7)
     message_cache[channel_id] = messages
     logger.info(f"Indexed {len(messages)} messages in channel {channel_name} ({channel_id})")
     return f"Started indexing channel #{channel_name}."
+
 
 def extract_requested_timeframe(text):
     if "yesterday" in text:
@@ -104,9 +110,11 @@ def extract_requested_timeframe(text):
         return 0
     return None
 
+
 def extract_channel_id(text):
     match = re.search(r"<#(\w+)(?:\|[^>]+)?>", text)
     return match.group(1) if match else None
+
 
 def get_user_name(user_id):
     if user_id in user_cache:
@@ -119,6 +127,7 @@ def get_user_name(user_id):
     except SlackApiError as e:
         logger.error(f"Error fetching user name for {user_id}: {e.response['error']}")
         return user_id
+
 
 def resolve_user_name(name):
     try:
@@ -135,12 +144,14 @@ def resolve_user_name(name):
         logger.error(f"Failed to resolve user name '{name}': {e.response['error']}")
     return None
 
+
 def extract_datetime(text):
     try:
         return date_parser.parse(text, fuzzy=True)
     except Exception as e:
         logger.warning(f"Failed to extract date from '{text}': {e}")
         return None
+
 
 @app.event("app_mention")
 def handle_app_mention(body, say):
@@ -201,10 +212,13 @@ def handle_app_mention(body, say):
 
     say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40`.")
 
+
 def main():
     logger.info("⚡️ Slack Bot is starting...")
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
 
+
 if __name__ == "__main__":
     main()
+
