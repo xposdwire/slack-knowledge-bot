@@ -155,10 +155,10 @@ def handle_app_mention(body, say):
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
-    elif re.search(r"what did (.+?) say.*?(\d{1,2}[:\.]\d{2}.*?(am|pm|AM|PM)?( on .+?)?)", text):
-        match = re.search(r"what did (.+?) say.*?(\d{1,2}[:\.]\d{2}.*?(am|pm|AM|PM)?( on .+?)?)", text)
+    elif re.search(r"what did (.+?) (say|ask|mention|share).*?(\d{1,2}[:\.]\d{2}.*?(am|pm)?( on .+?)?)", text):
+        match = re.search(r"what did (.+?) (say|ask|mention|share).*?(\d{1,2}[:\.]\d{2}.*?(am|pm)?( on .+?)?)", text)
         user_name = match.group(1).strip()
-        time_text = match.group(2).strip()
+        time_text = match.group(3).strip()
         user_id = resolve_user_name(user_name)
 
         if not user_id:
