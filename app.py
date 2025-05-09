@@ -1,4 +1,3 @@
-#app.py
 import os
 import re
 import logging
@@ -46,7 +45,7 @@ def fetch_recent_messages(channel_id, count=100, days_back=None):
             limit=count,
             oldest=oldest_ts
         )
-        return response.get("messages", [])
+        return [m for m in response.get("messages", []) if m.get("subtype") != "bot_message"]
     except SlackApiError as e:
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
@@ -64,7 +63,7 @@ def fetch_messages_around_time(channel_id, target_time, minutes=10):
             inclusive=True,
             limit=100
         )
-        return response.get("messages", [])
+        return [m for m in response.get("messages", []) if m.get("subtype") != "bot_message"]
     except SlackApiError as e:
         logger.error(f"Error fetching messages: {e.response['error']}")
         return []
@@ -125,7 +124,6 @@ def resolve_user_name(name):
     try:
         users = client.users_list().get("members", [])
         lower_name = name.lower()
-
         for user in users:
             if (
                 user.get("name", "").lower() == lower_name or
@@ -174,9 +172,17 @@ def handle_app_mention(body, say):
             return
 
         target_time = extract_datetime(time_text) or datetime.now()
-
         messages = fetch_messages_around_time(channel_id, target_time)
-        hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
+
+        seen = set()
+        hits = []
+        for m in messages:
+            if m.get("user") == user_id and 'text' in m:
+                content = m["text"].strip()
+                if content and content not in seen:
+                    hits.append(m)
+                    seen.add(content)
+
         if hits:
             say("\n".join(f"<@{m['user']}> said at {datetime.fromtimestamp(float(m['ts'])).strftime('%I:%M %p')}: {m['text']}" for m in hits))
         else:
