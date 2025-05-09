@@ -29,7 +29,7 @@ user_cache = {}
 def get_channel_name(channel_id):
     try:
         result = client.conversations_info(channel=channel_id)
-        return result["channel"]["name"]
+        return result["channel"].get("name", channel_id)
     except SlackApiError as e:
         logger.error(f"Slack API error while getting channel name: {e.response['error']}")
         return channel_id
@@ -113,7 +113,7 @@ def get_user_name(user_id):
         return user_cache[user_id]
     try:
         info = client.users_info(user=user_id)
-        name = info["user"]["name"]
+        name = info["user"].get("real_name") or info["user"].get("name")
         user_cache[user_id] = name
         return name
     except SlackApiError as e:
@@ -123,15 +123,22 @@ def get_user_name(user_id):
 def resolve_user_name(name):
     try:
         users = client.users_list().get("members", [])
+        lower_name = name.lower()
+
         for user in users:
-            if user.get("name", "").lower() == name.lower():
+            if (
+                user.get("name", "").lower() == lower_name or
+                user.get("real_name", "").lower() == lower_name or
+                user.get("profile", {}).get("display_name", "").lower() == lower_name or
+                user.get("id", "") == name
+            ):
                 return user.get("id")
     except SlackApiError as e:
         logger.error(f"Failed to resolve user name '{name}': {e.response['error']}")
     return None
 
 # --- NLP-based Command Handler ---
-@app.event("app_mention")
+@ app.event("app_mention")
 def handle_app_mention(body, say):
     event = body.get("event", {})
     text = event.get("text", "").lower()
@@ -149,8 +156,8 @@ def handle_app_mention(body, say):
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
-    elif re.search(r"what did (\w+) say.*?(\d{1,2}:\d{2})", text):
-        match = re.search(r"what did (\w+) say.*?(\d{1,2}:\d{2})", text)
+    elif re.search(r"what did ([^\s]+) say.*?(\d{1,2}:\d{2})", text):
+        match = re.search(r"what did ([^\s]+) say.*?(\d{1,2}:\d{2})", text)
         user_name = match.group(1)
         time_str = match.group(2)
         user_id = resolve_user_name(user_name)
