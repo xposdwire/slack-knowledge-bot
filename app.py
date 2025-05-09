@@ -27,7 +27,7 @@ MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
 USER_CACHE_FILE = DATA_DIR / "user_name_cache.pkl"
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 class SlackKnowledgeBot:
     def __init__(self):
@@ -149,7 +149,7 @@ class SlackKnowledgeBot:
     def _generate_llm_answer(self, query):
         try:
             system_prompt = "You are a helpful assistant in Slack. Use your knowledge and sound like a team member."
-            response = openai_client.chat.completions.create(
+            response = openai.ChatCompletion.create(
                 model="gpt-4",
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -158,7 +158,7 @@ class SlackKnowledgeBot:
                 temperature=0.7,
                 max_tokens=600
             )
-            return response.choices[0].message.content.strip()
+            return response["choices"][0]["message"]["content"].strip()
         except Exception as e:
             logger.error(f"LLM response error: {e}")
             return "I'm sorry, I couldn't process that request."
@@ -180,13 +180,18 @@ class SlackKnowledgeBot:
             logger.error(f"Summarize error: {e}")
             return "I couldn't summarize that discussion."
 
-@app.command("/refresh")
-def handle_refresh(ack, body, say: Say):
-    ack()
-    channel_id = body['channel_id']
-    say("Re-indexing messages in this channel... this may take a moment.")
-    app.knowledge_bot.index_channel(channel_id, days_back=7)
-    say("Done! Channel re-indexed.")
+def extract_channel_id(query_text):
+    # Match <#C12345678|channel-name>, #channel-name, or plain name
+    patterns = [
+        r"<#(C[0-9A-Z]+)\|[\w\-]+>",
+        r"#([\w\-]+)",
+        r"\b([C][0-9A-Z]{8,})\b"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, query_text)
+        if match:
+            return match.group(1)
+    return None
 
 @app.event("app_mention")
 def handle_app_mention(event, say):
@@ -200,24 +205,22 @@ def handle_app_mention(event, say):
 
     if re.search(r"summarize.*this channel", query, re.I):
         response = app.knowledge_bot.summarize_discussion(channel_id)
-    elif match := re.search(r"(?:summarize|what was discussed).*?(about|on)?\s*(\w+)?(?:\s+(today|yesterday|\d{1,2} \w+|\w+ \d{1,2}))?", query, re.I):
-        _, keyword, date_hint = match.groups()
+    elif match := re.search(r"(summarize|what(?:'s| is)?(?: the)? discussion about|what was discussed).*?(about|on)?\s*(\w+)?(?:\s+(today|yesterday|\d{1,2} \w+|\w+ \d{1,2}))?", query, re.I):
+        _, _, keyword, date_hint = match.groups()
         day = datetime.today().date() - timedelta(days=1) if date_hint and "yesterday" in date_hint else datetime.today().date()
         response = app.knowledge_bot.summarize_discussion(channel_id, keyword, day)
-    elif match := re.search(r"(?:index|fetch|load|grab|get history).*channel.*[#<]?([A-Z0-9_\-]+)", query, re.I):
-        input_id = match.group(1).strip()
-        result = app.client.conversations_list(types="public_channel,private_channel")
-        match_id = next((c['id'] for c in result['channels'] if c['name'] == input_id or c['id'] == input_id), None)
-        if match_id:
-            app.knowledge_bot.index_channel(match_id)
-            response = f"Indexed channel <#{match_id}>!"
+    elif re.search(r"(index|fetch|load|grab|get history).*channel", query, re.I):
+        input_id = extract_channel_id(query)
+        if input_id:
+            result = app.client.conversations_list(types="public_channel,private_channel")
+            match_id = next((c['id'] for c in result['channels'] if c['name'] == input_id or c['id'] == input_id), None)
+            if match_id:
+                app.knowledge_bot.index_channel(match_id)
+                response = f"Indexed channel <#{match_id}>!"
+            else:
+                response = f"Couldn't find a channel named or with ID '{input_id}'."
         else:
-            response = f"Couldn't find a channel named or with ID '{input_id}'."
-    elif re.search(r"what can you tell me about this channel", query, re.I):
-        response = app.knowledge_bot.get_channel_info(channel_id)
-    elif match := re.search(r"what did (.+?) ask (?:at|on|around|about)? (.+)", query):
-        who, when = match.groups()
-        response = app.knowledge_bot.get_message_by_time(channel_id, when.strip(), who.strip())
+            response = "No recognizable channel ID or name provided."
     elif re.search(r"who.*(here|in this channel)", query, re.I):
         response = app.knowledge_bot.list_users_in_channel(channel_id)
     else:
@@ -230,3 +233,4 @@ if __name__ == "__main__":
     app.knowledge_bot.auto_index_all_channels()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()
+
