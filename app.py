@@ -10,22 +10,17 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from dateutil import parser as date_parser
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SlackBot")
 
-# Initialize Slack and OpenAI
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# In-memory cache for user names
 user_cache = {}
 
-# --- Helper Functions ---
 def get_channel_name(channel_id):
     try:
         result = client.conversations_info(channel=channel_id)
@@ -142,8 +137,7 @@ def extract_datetime(text):
     except Exception:
         return None
 
-# --- NLP-based Command Handler ---
-@ app.event("app_mention")
+@app.event("app_mention")
 def handle_app_mention(body, say):
     event = body.get("event", {})
     text = event.get("text", "").lower()
@@ -161,10 +155,10 @@ def handle_app_mention(body, say):
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
-    elif re.search(r"what did ([^\s]+) say.*?(\d{1,2}[:\.]\d{2}.*?\w*\s*\d{0,2})?", text):
-        match = re.search(r"what did ([^\s]+) say.*?(\d{1,2}[:\.]\d{2}.*?\w*\s*\d{0,2})?", text)
-        user_name = match.group(1)
-        time_text = match.group(2) or ""
+    elif re.search(r"what did (.+?) say.*?(\d{1,2}[:\.]\d{2}.*?(am|pm|AM|PM)?( on .+?)?)", text):
+        match = re.search(r"what did (.+?) say.*?(\d{1,2}[:\.]\d{2}.*?(am|pm|AM|PM)?( on .+?)?)", text)
+        user_name = match.group(1).strip()
+        time_text = match.group(2).strip()
         user_id = resolve_user_name(user_name)
 
         if not user_id:
@@ -174,17 +168,10 @@ def handle_app_mention(body, say):
         target_time = extract_datetime(time_text) or datetime.now()
         messages = fetch_messages_around_time(channel_id, target_time)
 
-        seen = set()
-        hits = []
-        for m in messages:
-            if m.get("user") == user_id and 'text' in m:
-                content = m["text"].strip()
-                if content and content not in seen:
-                    hits.append(m)
-                    seen.add(content)
-
+        hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
         if hits:
-            say("\n".join(f"<@{m['user']}> said at {datetime.fromtimestamp(float(m['ts'])).strftime('%I:%M %p')}: {m['text']}" for m in hits))
+            closest = sorted(hits, key=lambda m: abs(float(m["ts"]) - target_time.timestamp()))[0]
+            say(f"<@{closest['user']}> said at {datetime.fromtimestamp(float(closest['ts'])).strftime('%I:%M %p')}: {closest['text']}")
         else:
             say("No close messages found near that time.")
 
@@ -200,7 +187,6 @@ def handle_app_mention(body, say):
     else:
         say("I'm not sure how to respond. Try things like `summarize this channel`, `index this channel`, `who is in this channel?`, or `what did Alice say at 3:40?`.")
 
-# --- Entry Point ---
 def main():
     logger.info("⚡️ Slack Bot is starting...")
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
