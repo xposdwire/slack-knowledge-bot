@@ -17,8 +17,7 @@ logger = logging.getLogger("SlackBot")
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
-openai.api_key = os.getenv("OPENAI_API_KEY")
-openai_client = openai
+openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 user_cache = {}
 message_cache = {}
@@ -83,14 +82,14 @@ def summarize_messages(messages):
     )
 
     try:
-        response = openai_client.ChatCompletion.create(
+        response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant summarizing Slack conversations."},
                 {"role": "user", "content": full_prompt},
             ]
         )
-        return response["choices"][0]["message"]["content"].strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"OpenAI summarization error: {e}")
         return "Failed to generate summary."
@@ -191,7 +190,7 @@ def handle_app_mention(body, say):
         target_time = extract_datetime(time_text or "") or datetime.now()
         messages = message_cache.get(channel_id) or fetch_recent_messages(channel_id)
 
-        hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
+        hits = [m for m in messages if m.get("user") == user_id and 'text' in m and not m.get("subtype")]
         if hits:
             closest = sorted(hits, key=lambda m: abs(float(m["ts"]) - target_time.timestamp()))[0]
             timestamp = datetime.fromtimestamp(float(closest['ts'])).strftime('%I:%M %p')
@@ -222,4 +221,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
