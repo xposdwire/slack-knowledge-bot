@@ -27,7 +27,7 @@ MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
 USER_CACHE_FILE = DATA_DIR / "user_name_cache.pkl"
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
 
 class SlackKnowledgeBot:
     def __init__(self):
