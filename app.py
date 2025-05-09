@@ -9,6 +9,7 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 from openai import OpenAI
+from dateutil import parser as date_parser
 
 # Load environment variables
 load_dotenv()
@@ -137,6 +138,12 @@ def resolve_user_name(name):
         logger.error(f"Failed to resolve user name '{name}': {e.response['error']}")
     return None
 
+def extract_datetime(text):
+    try:
+        return date_parser.parse(text, fuzzy=True)
+    except Exception:
+        return None
+
 # --- NLP-based Command Handler ---
 @ app.event("app_mention")
 def handle_app_mention(body, say):
@@ -156,28 +163,24 @@ def handle_app_mention(body, say):
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
-    elif re.search(r"what did ([^\s]+) say.*?(\d{1,2}:\d{2})", text):
-        match = re.search(r"what did ([^\s]+) say.*?(\d{1,2}:\d{2})", text)
+    elif re.search(r"what did ([^\s]+) say.*?(\d{1,2}[:\.]\d{2}.*?\w*\s*\d{0,2})?", text):
+        match = re.search(r"what did ([^\s]+) say.*?(\d{1,2}[:\.]\d{2}.*?\w*\s*\d{0,2})?", text)
         user_name = match.group(1)
-        time_str = match.group(2)
+        time_text = match.group(2) or ""
         user_id = resolve_user_name(user_name)
 
         if not user_id:
             say(f"Sorry, I couldn't match the name '{user_name}' to a Slack user.")
             return
 
-        try:
-            now = datetime.now()
-            target_time = now.replace(hour=int(time_str.split(":" )[0]), minute=int(time_str.split(":" )[1]), second=0)
-            messages = fetch_messages_around_time(channel_id, target_time)
-            hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
-            if hits:
-                say("\n".join(f"<@{m['user']}> said at {datetime.fromtimestamp(float(m['ts'])).strftime('%I:%M %p')}: {m['text']}" for m in hits))
-            else:
-                say("No close messages found near that time.")
-        except Exception as e:
-            logger.error(f"Error processing time-based message search: {e}")
-            say("I couldn't retrieve messages for that time.")
+        target_time = extract_datetime(time_text) or datetime.now()
+
+        messages = fetch_messages_around_time(channel_id, target_time)
+        hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
+        if hits:
+            say("\n".join(f"<@{m['user']}> said at {datetime.fromtimestamp(float(m['ts'])).strftime('%I:%M %p')}: {m['text']}" for m in hits))
+        else:
+            say("No close messages found near that time.")
 
     elif "who is in this channel" in text or "user list" in text:
         try:
