@@ -1,5 +1,4 @@
 ﻿# app.py
-# app.py
 import os
 import re
 import io
@@ -14,7 +13,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 
-from openai import OpenAI
+import openai
 from dateutil import parser as dt_parser
 from difflib import get_close_matches
 from slack_bolt.context.say import Say
@@ -28,7 +27,7 @@ MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
 USER_CACHE_FILE = DATA_DIR / "user_name_cache.pkl"
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class SlackKnowledgeBot:
     def __init__(self):
@@ -200,12 +199,17 @@ class SlackKnowledgeBot:
             logger.error(f"Time parse error: {e}")
             return "I had trouble understanding the time. Try something like 'yesterday at 3 PM'."
 
-    def find_messages_by_keyword(self, channel_id, keyword):
+    def find_messages_by_keyword(self, channel_id, keyword, time_str=None):
         try:
             keyword = keyword.lower()
+            messages = self.channel_messages.get(channel_id, [])
+            if time_str:
+                target_dt = dt_parser.parse(time_str, fuzzy=True, default=datetime.now())
+                start = target_dt.replace(hour=0, minute=0, second=0)
+                end = target_dt.replace(hour=23, minute=59, second=59)
+                messages = [m for m in messages if start.timestamp() <= float(m["ts"]) <= end.timestamp()]
             matches = [
-                msg for msg in self.channel_messages.get(channel_id, [])
-                if keyword in msg.get("text", "").lower()
+                m for m in messages if keyword in m.get("text", "").lower()
             ]
             if not matches:
                 return f"No messages found containing '{keyword}'."
@@ -241,9 +245,14 @@ def handle_app_mention(event, say):
     elif match := re.search(r"what did (.+?) ask (?:at|on|around|about)? (.+)", query):
         who, when = match.groups()
         response = app.knowledge_bot.get_message_by_time(channel_id, when.strip(), who.strip())
-    elif re.search(r"when did (\w+) mention (.+)", query):
-        keyword = re.findall(r"mention (.+)", query)[0].strip()
-        response = app.knowledge_bot.find_messages_by_keyword(channel_id, keyword)
+    elif match := re.search(r"what was discussed (?:at|on|around|about)? (.+)", query):
+        topic_time = match.group(1)
+        topic_match = re.search(r'(.*) (yesterday|today|[0-9]{1,2}(:[0-9]{2})? ?[APap][Mm])', topic_time)
+        if topic_match:
+            topic, date = topic_match.groups()[0], topic_match.groups()[1]
+            response = app.knowledge_bot.find_messages_by_keyword(channel_id, topic.strip(), date.strip())
+        else:
+            response = app.knowledge_bot.find_messages_by_keyword(channel_id, topic_time.strip())
     elif re.search(r"who.*(here|in this channel)", query, re.I):
         response = app.knowledge_bot.list_users_in_channel(channel_id)
     else:
