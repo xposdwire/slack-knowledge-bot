@@ -118,7 +118,7 @@ def get_user_name(user_id):
 def resolve_user_name(name):
     try:
         users = client.users_list().get("members", [])
-        lower_name = name.lower()
+        lower_name = name.lower().strip("@")
         for user in users:
             if (
                 user.get("name", "").lower() == lower_name or
@@ -155,8 +155,8 @@ def handle_app_mention(body, say):
         messages = fetch_recent_messages(channel_id, days_back=days_back)
         say(summarize_messages(messages))
 
-    elif re.search(r"what did (.+?) (say|ask|mention|share).*?(\d{1,2}[:\.]\d{2}.*?(am|pm)?( on .+?)?)", text):
-        match = re.search(r"what did (.+?) (say|ask|mention|share).*?(\d{1,2}[:\.]\d{2}.*?(am|pm)?( on .+?)?)", text)
+    elif re.search(r"what did (.+?) (say|ask|mention|share|do).*?(\d{1,2}[:\.]\d{2}( ?(am|pm))?( on [^\n\r]+)?)", text):
+        match = re.search(r"what did (.+?) (say|ask|mention|share|do).*?(\d{1,2}[:\.]\d{2}( ?(am|pm))?( on [^\n\r]+)?)", text)
         user_name = match.group(1).strip()
         time_text = match.group(3).strip()
         user_id = resolve_user_name(user_name)
@@ -171,7 +171,8 @@ def handle_app_mention(body, say):
         hits = [m for m in messages if m.get("user") == user_id and 'text' in m]
         if hits:
             closest = sorted(hits, key=lambda m: abs(float(m["ts"]) - target_time.timestamp()))[0]
-            say(f"<@{closest['user']}> said at {datetime.fromtimestamp(float(closest['ts'])).strftime('%I:%M %p')}: {closest['text']}")
+            timestamp = datetime.fromtimestamp(float(closest['ts'])).strftime('%I:%M %p')
+            say(f"<@{closest['user']}> said at {timestamp}: {closest['text']}")
         else:
             say("No close messages found near that time.")
 
@@ -194,4 +195,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
