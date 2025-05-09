@@ -1,4 +1,5 @@
 ﻿# app.py
+# app.py
 import os
 import re
 import io
@@ -13,7 +14,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 
-import openai
+from openai import OpenAI
 from dateutil import parser as dt_parser
 from difflib import get_close_matches
 from slack_bolt.context.say import Say
@@ -27,7 +28,7 @@ MESSAGE_HISTORY_FILE = DATA_DIR / "message_history.pkl"
 USER_CACHE_FILE = DATA_DIR / "user_name_cache.pkl"
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-openai_client = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class SlackKnowledgeBot:
     def __init__(self):
@@ -255,3 +256,4 @@ if __name__ == "__main__":
     app.knowledge_bot.auto_index_all_channels()
     handler = SocketModeHandler(app, os.getenv("SLACK_APP_TOKEN"))
     handler.start()
+
